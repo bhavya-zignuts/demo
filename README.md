@@ -1,254 +1,164 @@
-AWS IAM Activity Monitor
-Setup Guide
-Step-by-step instructions via Command Line & AWS Console UI
+# Someone Deleted a Production S3 Bucket at 2 AM — Here's the Monitoring System That Would Have Caught It
 
+**Build a real-time AWS IAM activity monitor using CloudTrail, EventBridge, Lambda, and SNS — no third-party tools, no extra costs**
 
-👥  Audience
-Beginners — no prior AWS CLI experience needed
-🌏  Region
-ap-south-1 (Mumbai) shown as example
-🔑  Access
-IAM Admin access only — root not required
+---
 
+There is a story that circulates in cloud engineering circles that goes something like this: a startup woke up one morning to find that a senior developer, working late the night before, had accidentally deleted the wrong S3 bucket during a cleanup task. The bucket held three years of user-uploaded content. Backups existed — but were two weeks old. Recovery took four days and cost the company over $200,000 in lost data, engineering time, and emergency infrastructure work.
 
-❗ IMPORTANT
-All commands in this document use placeholder values like <your-account-id>. You must replace every placeholder with your actual values before running. A replacement guide is provided before each command block.
+The painful part was not the mistake itself. Humans make mistakes. The painful part was that no one knew it had happened until customers started filing support tickets the next morning. There was no alert. There was no notification. There was no trail of breadcrumbs that would have let someone catch the deletion within minutes — before caches expired, before CDNs purged, before the situation became irreversible.
 
+When you read a story like that, the first question that comes to mind is not "how do we prevent mistakes?" — you cannot. The question is: "how do we know immediately when something changes in our AWS environment?"
 
+That is exactly what this guide builds.
 
-Section 0 — How It Works
-Before setting anything up, it is important to understand what you are building and why each component is needed. The diagram below shows the full flow from an IAM user taking action to you receiving an email alert.
+---
 
-0.1  The Complete Flow
+## Why This Problem Matters
 
-IAM User
-Does any action
-→
-CloudTrail
-Logs the API call
-→
-S3 Bucket
-Stores log file
-→
-EventBridge
-Detects new file
-→
-Lambda + SNS
-Sends email alert
+AWS accounts in real organisations are busy places. IAM users are creating EC2 instances, modifying security groups, attaching policies, running Lambda functions, and deleting objects dozens or hundreds of times a day. Most of it is routine. Some of it is accidental. A small fraction of it is something you absolutely need to know about the moment it happens.
 
+The standard AWS Console provides CloudTrail — a service that records every API call made in your account. But CloudTrail on its own is a passive archive. It records everything and then sits quietly waiting for someone to come looking. Nobody goes looking until something breaks.
 
-0.2  What Each Component Does
+What this project does is flip that model. Instead of you going to find the logs, the logs come to find you. The moment any IAM user performs a write action anywhere in your account — creates a bucket, launches an instance, modifies a policy, deletes a function — you receive a detailed email within 5 to 15 minutes, formatted to tell you exactly who did it, from where, at what time, and on what resource.
 
-Component
-AWS Service
-What it does in this setup
-CloudTrail
-AWS CloudTrail
-Records every API call made by every IAM user in every region. When someone creates a bucket, launches an EC2, or deletes a user — CloudTrail captures it.
-Log Storage
-Amazon S3
-CloudTrail writes the captured log files into an S3 bucket every 5–15 minutes. These are compressed (.gz) JSON files.
-Trigger
-Amazon EventBridge
-Watches the S3 bucket. The moment a new CloudTrail log file is written, EventBridge fires a rule that calls Lambda.
-Alert Processor
-AWS Lambda
-Reads the log file from S3, loops through every event inside it, formats a detailed email message and sends it via SNS.
-Email Delivery
-Amazon SNS
-Receives the message from Lambda and delivers it to all subscribed email addresses immediately.
+It solves several real problems at once:
 
+- Security auditing becomes passive rather than active — you do not need to remember to check logs
+- Accidental deletions or misconfigurations surface immediately, while they can still be reversed
+- In regulated environments, you have an automatic audit trail delivered to your inbox
+- In team environments, every admin can be subscribed, so shared accountability becomes the default
 
-0.3  Why This Approach?
-This setup uses S3 → EventBridge instead of CloudTrail → CloudWatch Logs → EventBridge because the CloudWatch Logs method requires an additional IAM permission (iam:PassRole) that may be restricted in AWS Organization accounts. The S3-based approach works reliably with standard IAM Admin access.
+---
 
-📌 NOTE
-Email alerts arrive 5–15 minutes after the action, not instantly. This is because CloudTrail batches log deliveries to S3. This is normal and expected behaviour.
+## Project Overview
 
+Here is what the final system looks like from the outside:
 
+- Any IAM user performs a write action (create, update, delete, modify) anywhere in your AWS account
+- Within 5 to 15 minutes, you receive a formatted email with the action type, the user who performed it, the AWS region, the exact timestamp, the resource details, and the source IP address
+- The system covers all AWS regions by default — not just one
+- It filters out read-only calls (List, Describe, Get) so your inbox does not flood with noise
+- It requires no third-party tools, no paid monitoring services, and no agents installed anywhere
 
-Section 1 — Before You Start
-1.1  Prerequisites
-Make sure you have all of the following before running any commands:
+The components involved are: SNS for email delivery, S3 for log storage, CloudTrail for API capture, EventBridge for triggering, Lambda for processing, and IAM for permissions.
 
-Requirement
-How to check
-Required
-AWS account with IAM Admin access
-Go to IAM → Users → your user → check AdministratorAccess policy is attached
-YES
-Access to AWS CloudShell
-Log in to AWS Console → click the terminal icon (>_) in the top navigation bar
-YES
-Your AWS Account ID
-Go to AWS Console → click your account name (top right) — 12-digit number shown
-YES
-An email address to receive alerts
-Any valid email inbox you can access — can add multiple recipients
-YES
-Root access
-Not needed at all for this setup
-NO
+---
 
+## Architecture and Workflow
 
-1.2  How to Open AWS CloudShell
-All commands in Part A (Command Line) are run inside AWS CloudShell — a browser-based terminal built into the AWS Console. You do not need to install anything.
+```
+IAM User performs action
+         │
+         ▼
+    CloudTrail
+    (captures every API call across all regions)
+         │
+         ▼ every 5–15 minutes
+    S3 Bucket
+    (compressed .gz JSON log files)
+         │
+         ▼ on new file written
+    EventBridge Rule
+    (detects Object Created event from S3)
+         │
+         ▼
+    Lambda Function
+    (reads log, extracts events, formats email)
+         │
+         ▼
+    SNS Topic
+    (publishes to all subscribed email addresses)
+         │
+         ▼
+    Your Inbox 📧
+```
 
-Step 1:  Log in to AWS Console
-Go to https://console.aws.amazon.com and sign in with your IAM user credentials.
-📷  In the top-right corner, you should see your username and account name.
+Why this specific path — S3 to EventBridge — rather than the more commonly documented CloudTrail to CloudWatch Logs route? Because the CloudWatch Logs approach requires an IAM permission called `iam:PassRole` that is frequently restricted in AWS Organization accounts. If your account lives inside an Organisation, you may not have that permission even with AdministratorAccess. The S3-based approach works reliably with standard IAM Admin access across all account types.
 
+---
 
-Step 2:  Open CloudShell
-Look for the terminal icon (>_) in the top navigation bar, next to the bell icon. Click it. A terminal panel will open at the bottom of the screen.
-📷  The terminal panel opens at the bottom. Wait a few seconds for it to initialise — you will see a $ prompt when it is ready.
+## Prerequisites
 
+Before starting, confirm you have the following:
 
-Step 3:  Make sure you are in the right region
-Check the region selector in the top-right of the AWS Console. It should show Asia Pacific (Mumbai). If not, click it and select ap-south-1.
-📷  The region name is shown between your account name and the bell icon at the top right.
+- An AWS account with IAM Admin access (AdministratorAccess policy attached to your user)
+- Access to AWS CloudShell — the browser-based terminal built into the AWS Console, no installation needed
+- Your 12-digit AWS Account ID, visible in the top-right corner of the AWS Console
+- An email address where you want to receive alerts
 
+You do not need root access. You do not need the AWS CLI installed locally. Everything runs inside CloudShell.
 
-✅ TIP
-CloudShell is already authenticated as your IAM user. You do not need to configure any credentials or API keys.
+> ✅ **About the placeholder values in this guide:** Every command uses placeholders like `<your-account-id>` and `<your-region>`. You must substitute your real values before running any command. A full reference table appears before each command block.
 
+---
 
-1.3  Placeholder Reference — Replace Before Running
-Every command in this guide uses safe placeholder values instead of real account details. You MUST replace these placeholders with your own values before running any command.
+## Step-by-Step Implementation
 
-Placeholder
-Example Value
-What to replace with
-<your-account-id>
-123456789012
-Your 12-digit AWS Account ID (find it in top-right of AWS Console)
-<your-region>
-ap-south-1
-The AWS region you are working in (e.g. ap-south-1 for Mumbai)
-<your-email@domain.com>
-admin@mycompany.com
-The email address where you want to receive alerts
-<your-bucket-name>
-cloudtrail-logs-123456789012
-A unique name for your CloudTrail S3 bucket (must be globally unique)
-<your-trail-name>
-resource-monitor-trail
-A name for your CloudTrail trail
-<your-topic-name>
-resource-change-alerts
-A name for your SNS notification topic
-<your-function-name>
-cloudtrail-alert-handler
-A name for your Lambda function
-<your-rule-name>
-detect-cloudtrail-log-created
-A name for your EventBridge rule
-<your-role-name>
-lambda-cloudtrail-role
-A name for the IAM role that Lambda will use
+### Step 1: Create the SNS Topic and Subscribe Your Email
 
+SNS (Simple Notification Service) is the delivery mechanism — think of it as a mailing list. You create a topic (the list), and your email address subscribes to it. Later, Lambda will publish messages to this topic, and SNS delivers them to every subscriber.
 
-✅ TIP
-Tip: Bucket names must be globally unique across all AWS accounts worldwide. A good pattern is: cloudtrail-logs-<your-account-id>  — using your account ID guarantees it will be unique.
+Open AWS CloudShell from the terminal icon in the top navigation bar and wait for the prompt.
 
+| Placeholder | Example | Replace with |
+|---|---|---|
+| `<your-topic-name>` | `resource-change-alerts` | Any name, hyphens allowed, no spaces |
+| `<your-region>` | `ap-south-1` | Your AWS region |
 
-
-PART A
-Setup via Command Line (AWS CloudShell)
-
-
-Open AWS CloudShell (see Section 1.2 above) and run the commands below one step at a time. Each step includes a description of what it does and what the expected output looks like.
-
-1
-Create SNS Topic and Subscribe Your Email
-SNS (Simple Notification Service) is the email delivery mechanism. You create a topic (a channel) and subscribe your email to it.
-
-
-1a — Create the SNS Topic
-Run this command in CloudShell. Replace the placeholders with your own values:
-
-Placeholder
-Example Value
-What to replace with
-<your-topic-name>
-resource-change-alerts
-Pick any name — no spaces allowed, use hyphens
-<your-region>
-ap-south-1
-Your AWS region
-
-
-CloudShell command — replace placeholders first
+```bash
 aws sns create-topic \
   --name <your-topic-name> \
   --region <your-region>
+```
 
+The output returns a `TopicArn` that looks like:
 
-Example with real values:
-Example only — do not copy this directly
-aws sns create-topic \
-  --name resource-change-alerts \
-  --region ap-south-1
-
-
-Expected output:
+```json
 {
-    "TopicArn": "arn:aws:sns:<your-region>:<your-account-id>:<your-topic-name>"
+    "TopicArn": "arn:aws:sns:ap-south-1:123456789012:resource-change-alerts"
 }
+```
 
+> ❗ **Copy this ARN immediately.** You will need it in Steps 4 and 5. Save it in a text file or note.
 
-❗ IMPORTANT
-Copy the TopicArn value from your output. You will need it in later steps. Save it somewhere — for example: arn:aws:sns:ap-south-1:123456789012:resource-change-alerts
+Now subscribe your email to the topic:
 
-
-1b — Subscribe Your Email to the Topic
-Replace <your-topic-arn> with the TopicArn you copied above, and <your-email@domain.com> with your email address:
-
-CloudShell command — replace placeholders first
+```bash
 aws sns subscribe \
   --topic-arn <your-topic-arn> \
   --protocol email \
   --notification-endpoint <your-email@domain.com> \
   --region <your-region>
+```
 
+> ⚠️ **Critical:** AWS immediately sends a confirmation email to your inbox. You must open that email and click the "Confirm subscription" link. If you skip this step, you will never receive any alerts. Also check your spam folder — AWS notification emails sometimes land there.
 
-⚠ WARNING
-After running this command, AWS will send a confirmation email to your inbox. Open that email and click the 'Confirm subscription' link. If you do not confirm, you will never receive alerts. Also check your spam/junk folder.
+To add additional recipients (other admins, a team inbox), simply repeat the subscribe command with each additional email address. There is no limit on subscribers.
 
+[Insert Screenshot Here: CloudShell terminal showing TopicArn in output]
 
-To add more email recipients (e.g. other admin users), simply repeat the subscribe command with a different email address. You can have as many subscribers as you need.
+---
 
+### Step 2: Create the S3 Bucket for CloudTrail Logs
 
-2
-Create S3 Bucket for CloudTrail Logs
-This S3 bucket is where CloudTrail will store all the API call logs. EventBridge will watch this bucket for new files.
+This bucket is the storage layer where CloudTrail writes its log files. EventBridge watches this bucket and fires whenever a new file appears. The bucket needs two things beyond basic creation: a policy granting CloudTrail write access, and EventBridge notifications enabled.
 
+| Placeholder | Example | Replace with |
+|---|---|---|
+| `<your-bucket-name>` | `cloudtrail-logs-123456789012` | Must be globally unique — use your account ID |
+| `<your-region>` | `ap-south-1` | Your AWS region |
 
-2a — Create the bucket
-Placeholder
-Example Value
-What to replace with
-<your-bucket-name>
-cloudtrail-logs-123456789012
-Must be globally unique — use your account ID in the name
-<your-region>
-ap-south-1
-Your AWS region
-
-
-CloudShell command — replace placeholders first
+```bash
 aws s3 mb s3://<your-bucket-name> \
   --region <your-region>
+```
 
+> ✅ **Tip on bucket naming:** S3 bucket names must be unique across every AWS account in the world, not just yours. The pattern `cloudtrail-logs-<your-account-id>` is a reliable choice — your account ID guarantees global uniqueness.
 
-Expected output:
-make_bucket: <your-bucket-name>
+Next, attach the bucket policy. Without this, CloudTrail will refuse to write to the bucket. The policy grants two specific permissions: the ability for CloudTrail to read the bucket ACL, and the ability to write objects under the `AWSLogs/<your-account-id>/` prefix.
 
-
-2b — Attach bucket policy so CloudTrail can write to it
-CloudTrail needs explicit permission to write log files into your bucket. Run the command below — replace <your-bucket-name> and <your-account-id>:
-
-CloudShell command — replace <your-bucket-name> and <your-account-id>
+```bash
 aws s3api put-bucket-policy \
   --bucket <your-bucket-name> \
   --policy '{
@@ -273,43 +183,35 @@ aws s3api put-bucket-policy \
       }
     ]
   }'
+```
 
+No output from this command means success — that is expected behaviour.
 
-If successful, this command produces no output. That is normal.
+Finally, enable EventBridge notifications on the bucket. This single command tells S3 to emit an event to EventBridge every time any object is created in this bucket:
 
-2c — Enable EventBridge notifications on the bucket
-This tells S3 to send an event to EventBridge every time a new file is written into this bucket:
-
-CloudShell command — replace <your-bucket-name>
+```bash
 aws s3api put-bucket-notification-configuration \
   --bucket <your-bucket-name> \
   --notification-configuration '{"EventBridgeConfiguration": {}}'
+```
 
+Again, no output means it worked.
 
-If successful, this command produces no output. That is normal.
+[Insert Screenshot Here: AWS Console S3 bucket with EventBridge notifications enabled (green "On" toggle)]
 
+---
 
-3
-Create CloudTrail
-CloudTrail is the service that records every API call. We create a multi-region trail so it captures actions in ALL regions — not just the one you are working in.
+### Step 3: Create the CloudTrail Trail
 
+CloudTrail is the recording layer. It intercepts every API call made in your account and writes a record of it. We create a multi-region trail, which means it captures actions in every AWS region — not just the one you are working in. Without multi-region coverage, someone spinning up an EC2 instance in `us-east-1` would be invisible to a trail configured only in `ap-south-1`.
 
-3a — Create the trail
-Placeholder
-Example Value
-What to replace with
-<your-trail-name>
-resource-monitor-trail
-Any name you like — no spaces
-<your-bucket-name>
-cloudtrail-logs-123456789012
-The bucket name you created in Step 2
-<your-region>
-ap-south-1
-Your AWS region
+| Placeholder | Example | Replace with |
+|---|---|---|
+| `<your-trail-name>` | `resource-monitor-trail` | Any name, no spaces |
+| `<your-bucket-name>` | `cloudtrail-logs-123456789012` | The bucket from Step 2 |
+| `<your-region>` | `ap-south-1` | Your AWS region |
 
-
-CloudShell command — replace placeholders first
+```bash
 aws cloudtrail create-trail \
   --name <your-trail-name> \
   --s3-bucket-name <your-bucket-name> \
@@ -317,34 +219,21 @@ aws cloudtrail create-trail \
   --include-global-service-events \
   --no-is-organization-trail \
   --region <your-region>
+```
 
+> ⚠️ **The `--no-is-organization-trail` flag is not optional.** If your account belongs to an AWS Organization and you omit this flag, CloudTrail will attempt to create an organisation-level trail and route events to the management account instead of yours. You will receive nothing.
 
-⚠ WARNING
-The flag --no-is-organization-trail is critical. Without it, if your account is part of an AWS Organization, events will go to the management account instead of yours and you will receive nothing.
+Start logging immediately after trail creation:
 
-
-Expected output:
-{
-    "Name": "<your-trail-name>",
-    "S3BucketName": "<your-bucket-name>",
-    "IsMultiRegionTrail": true,
-    "IsOrganizationTrail": false
-}
-
-
-3b — Start logging
-CloudShell command — replace placeholders first
+```bash
 aws cloudtrail start-logging \
   --name <your-trail-name> \
   --region <your-region>
+```
 
+Now configure the trail to only capture write events. This is a crucial quality-of-life decision. AWS APIs include thousands of read-only calls like `ListBuckets`, `DescribeInstances`, and `GetCallerIdentity` that happen continuously in the background. If you capture all events, your inbox will receive hundreds of emails per day for completely routine activity. Filtering to write-only events means you only hear about actions that actually change something.
 
-No output = success.
-
-3c — Set trail to capture Write events only
-We only want alerts for actions that change something (Create, Update, Delete). We exclude Read-only calls like List and Describe to avoid flooding your inbox.
-
-CloudShell command — replace placeholders first
+```bash
 aws cloudtrail put-event-selectors \
   --trail-name <your-trail-name> \
   --event-selectors '[{
@@ -352,24 +241,17 @@ aws cloudtrail put-event-selectors \
     "IncludeManagementEvents": true
   }]' \
   --region <your-region>
+```
 
+[Insert Screenshot Here: CloudTrail console showing trail status as "Logging" with green indicator]
 
+---
 
-4
-Create Lambda IAM Role
-Lambda needs a role (permission set) that allows it to: read log files from S3, write logs to CloudWatch, and send emails via SNS.
+### Step 4: Create the Lambda IAM Role
 
+Lambda functions need an IAM role — a permission set that defines what they are allowed to do. This role needs three specific abilities: reading objects from S3 (to fetch the log file), writing to CloudWatch Logs (so you can debug Lambda if something goes wrong), and publishing to SNS (to send the email).
 
-4a — Create the role
-Placeholder
-Example Value
-What to replace with
-<your-role-name>
-lambda-cloudtrail-role
-Any name — no spaces
-
-
-CloudShell command — replace <your-role-name>
+```bash
 aws iam create-role \
   --role-name <your-role-name> \
   --assume-role-policy-document '{
@@ -380,16 +262,13 @@ aws iam create-role \
       "Action": "sts:AssumeRole"
     }]
   }'
+```
 
+Copy the `Arn` from the output. It looks like `arn:aws:iam::123456789012:role/lambda-cloudtrail-role`. You will need this in Step 5.
 
-Copy the Role Arn from the output. Example:
-arn:aws:iam::<your-account-id>:role/<your-role-name>
+Now attach the actual permissions. Notice that the S3 permission is scoped specifically to your log bucket, and the SNS permission is scoped specifically to your topic. This follows the principle of least privilege — the function can only touch exactly what it needs.
 
-
-4b — Attach permissions to the role
-Replace <your-role-name>, <your-bucket-name>, <your-account-id>, <your-region>, and <your-topic-name>:
-
-CloudShell command — replace all placeholders
+```bash
 aws iam put-role-policy \
   --role-name <your-role-name> \
   --policy-name LambdaAlertsPolicy \
@@ -413,18 +292,17 @@ aws iam put-role-policy \
       }
     ]
   }'
+```
 
+---
 
+### Step 5: Create and Deploy the Lambda Function
 
-5
-Create Lambda Function
-Lambda is the brain of the system. It reads the CloudTrail log file from S3, extracts the details of what happened and who did it, and sends a formatted email.
+Lambda is the brain of the entire system. When EventBridge tells it a new log file has arrived in S3, it fetches the file, decompresses it, reads through every event record, classifies each action as CREATE, DELETE, UPDATE, or CHANGE, formats a readable email message, and publishes it to SNS.
 
+First, create the Python source file and package it for deployment:
 
-5a — Create the Python code file
-Run this entire block in CloudShell. It creates the Python file and zips it for deployment:
-
-CloudShell — paste this entire block at once
+```bash
 mkdir -p /tmp/lambda-alert
 
 cat > /tmp/lambda-alert/lambda_function.py << 'PYEOF'
@@ -515,32 +393,27 @@ PYEOF
 
 cd /tmp/lambda-alert && zip lambda.zip lambda_function.py
 echo 'Code packaged successfully'
+```
 
+**What each part of the code does:**
 
-5b — Deploy the Lambda function
-Replace all placeholders. Note: wait 10 seconds after creating the role before deploying Lambda — IAM roles take a moment to propagate.
+- `get_resource_details()` — a helper function that inspects the event source (S3, EC2, IAM, RDS, Lambda, DynamoDB) and extracts the most meaningful identifier for each service type. For S3 it returns the bucket name; for EC2 it returns the instance ID and type; for IAM it returns the user or role name. For any other service it falls back to dumping the raw request parameters.
 
-Placeholder
-Example Value
-What to replace with
-<your-function-name>
-cloudtrail-alert-handler
-Name for your Lambda function
-<your-account-id>
-123456789012
-Your 12-digit AWS Account ID
-<your-role-name>
-lambda-cloudtrail-role
-The role name created in Step 4
-<your-topic-arn>
-arn:aws:sns:ap-south-1:123456789012:resource-change-alerts
-The SNS Topic ARN from Step 1
-<your-region>
-ap-south-1
-Your AWS region
+- `lambda_handler()` — the main function. It receives the EventBridge event, extracts the S3 bucket and file key, fetches and decompresses the CloudTrail log, then loops through every record in the file. It skips read-only events (those with `readOnly: true`), classifies write events by tag, formats the email body, and publishes each one to SNS.
 
+- The action classification block (`[CREATE]`, `[DELETE]`, `[UPDATE]`, `[CHANGE]`) — uses simple keyword matching against the event name. `CreateBucket` becomes `[CREATE]`, `DeleteFunction` becomes `[DELETE]`, `ModifyDBInstance` becomes `[UPDATE]`. This makes the email subject immediately scannable.
 
-CloudShell command — replace all placeholders
+Now deploy the function. Note the 10-second wait — IAM roles require a brief propagation period before Lambda can assume them.
+
+| Placeholder | Replace with |
+|---|---|
+| `<your-function-name>` | Name for your Lambda function |
+| `<your-account-id>` | Your 12-digit AWS Account ID |
+| `<your-role-name>` | The role name from Step 4 |
+| `<your-topic-arn>` | The full SNS Topic ARN from Step 1 |
+| `<your-region>` | Your AWS region |
+
+```bash
 sleep 10  # Wait for IAM role to propagate
 
 aws lambda create-function \
@@ -552,30 +425,25 @@ aws lambda create-function \
   --environment Variables={SNS_TOPIC_ARN=<your-topic-arn>} \
   --timeout 30 \
   --region <your-region>
+```
 
+> ⚠️ **The timeout matters.** The default Lambda timeout is 3 seconds. Reading a CloudTrail log from S3 and publishing multiple SNS messages takes longer than that under normal conditions. Setting it to 30 seconds prevents silent failures where Lambda starts, runs out of time, and exits without sending anything.
 
+[Insert Screenshot Here: Lambda function page showing Deployed status and environment variable set]
 
-6
-Create EventBridge Rule
-EventBridge watches your S3 bucket. When CloudTrail writes a new log file, EventBridge automatically triggers your Lambda function.
+---
 
+### Step 6: Create the EventBridge Rule
 
-6a — Create the rule
-Placeholder
-Example Value
-What to replace with
-<your-rule-name>
-detect-cloudtrail-log-created
-Name for this rule
-<your-bucket-name>
-cloudtrail-logs-123456789012
-The same S3 bucket from Step 2
-<your-region>
-ap-south-1
-Your AWS region
+EventBridge is the trigger mechanism. It watches your S3 bucket and, the moment CloudTrail writes a new log file, fires the Lambda function automatically.
 
+| Placeholder | Replace with |
+|---|---|
+| `<your-rule-name>` | A name for this rule |
+| `<your-bucket-name>` | Your S3 bucket from Step 2 |
+| `<your-region>` | Your AWS region |
 
-CloudShell command — replace placeholders
+```bash
 aws events put-rule \
   --name <your-rule-name> \
   --event-pattern '{
@@ -587,29 +455,13 @@ aws events put-rule \
   }' \
   --state ENABLED \
   --region <your-region>
+```
 
+Copy the `RuleArn` from the output.
 
-Copy the RuleArn from the output. You will need it next.
+Grant EventBridge permission to invoke your Lambda function:
 
-6b — Allow EventBridge to invoke Lambda
-Placeholder
-Example Value
-What to replace with
-<your-function-name>
-cloudtrail-alert-handler
-Your Lambda function name from Step 5
-<your-account-id>
-123456789012
-Your 12-digit AWS Account ID
-<your-rule-name>
-detect-cloudtrail-log-created
-The rule name from Step 6a
-<your-region>
-ap-south-1
-Your AWS region
-
-
-CloudShell command — replace all placeholders
+```bash
 aws lambda add-permission \
   --function-name <your-function-name> \
   --statement-id AllowEventBridgeInvoke \
@@ -617,10 +469,11 @@ aws lambda add-permission \
   --principal events.amazonaws.com \
   --source-arn arn:aws:events:<your-region>:<your-account-id>:rule/<your-rule-name> \
   --region <your-region>
+```
 
+Then connect the rule to Lambda as its target:
 
-6c — Add Lambda as the EventBridge target
-CloudShell command — replace all placeholders
+```bash
 aws events put-targets \
   --rule <your-rule-name> \
   --targets '[{
@@ -628,322 +481,42 @@ aws events put-targets \
     "Arn": "arn:aws:lambda:<your-region>:<your-account-id>:function:<your-function-name>"
   }]' \
   --region <your-region>
+```
 
+[Insert Screenshot Here: EventBridge rule showing status Enabled with Lambda as the target]
 
+---
 
-7
-Test the Setup
-Create a test resource and verify you receive an email alert. Allow up to 15 minutes for the first alert — CloudTrail batches log delivery.
+### Step 7: Test the Full Pipeline
 
+Create a test S3 bucket to trigger the chain:
 
-7a — Create a test S3 bucket
-CloudShell — replace <your-region>
+```bash
 aws s3 mb s3://test-alert-check-12345 --region <your-region>
+```
 
+After about 2 minutes, verify CloudTrail captured the action:
 
-7b — Verify CloudTrail captured it (after 2 minutes)
-CloudShell — replace <your-region>
+```bash
 aws cloudtrail lookup-events \
   --lookup-attributes AttributeKey=EventName,AttributeValue=CreateBucket \
   --region <your-region> \
   --max-results 3
+```
 
+You should see your `CreateBucket` event in the output. The full email alert will arrive 5 to 15 minutes after the action — CloudTrail batches its log delivery to S3, so there is an inherent delay. This is normal and expected.
 
-You should see your CreateBucket event in the output.
+> ⚠️ **If no email arrives after 15 minutes:** Check these in order: (1) your SNS subscription shows "Confirmed" not "PendingConfirmation", (2) your spam/junk folder, (3) Lambda CloudWatch logs for errors. The most common error is that the `SNS_TOPIC_ARN` environment variable was set to the subscription ARN (which ends in a UUID) rather than the topic ARN.
 
-7c — Verify Lambda was invoked (after 5 minutes)
-CloudShell — replace placeholders
-aws lambda get-function-configuration \
-  --function-name <your-function-name> \
-  --region <your-region> \
-  --query LastModified
+---
 
+## Sample Alert Email
 
-7d — Check Lambda logs if no email arrived
-CloudShell — replace placeholders
-aws logs describe-log-groups \
-  --log-group-name-prefix /aws/lambda/<your-function-name> \
-  --region <your-region>
+Here is what arrives in your inbox for every write action:
 
+```
+Subject: [CREATE] john.admin did CreateBucket in ap-south-1
 
-⚠ WARNING
-If after 15 minutes you still have not received an email: (1) check your SNS subscription is Confirmed not PendingConfirmation, (2) check your spam folder, (3) check Lambda CloudWatch logs for errors.
-
-If you want to delete this flow then delete in this order:
-👉 EventBridge → Lambda → SNS → CloudTrail → (optional: S3 + IAM)
-
-PART B
-Setup via AWS Console (Browser UI)
-
-
-If you prefer not to use the command line, you can set up the entire system through the AWS Console browser interface. Follow the steps below. Each step includes exact navigation paths and what to look for on screen.
-
-✅ TIP
-The UI steps produce the exact same result as the CLI steps. You do not need to do both. Choose one method and complete it fully.
-
-
-1
-Create SNS Topic and Subscribe Email
-SNS → Topics → Create topic
-
-
-Step 1:  Navigate to SNS
-In the AWS Console search bar at the top, type SNS and click Simple Notification Service from the results.
-📷  The SNS dashboard shows Topics, Subscriptions, and other options in the left sidebar.
-
-
-Step 2:  Create a new topic
-Click Topics in the left sidebar, then click the orange Create topic button in the top right.
-📷  You will see two options: Standard and FIFO. Choose Standard.
-
-
-Step 3:  Fill in topic details
-Set Type to Standard. In the Name field, enter a name such as resource-change-alerts. Scroll down and click Create topic.
-📷  After creation, you will see the topic ARN displayed on the topic detail page. Copy this ARN — you will need it later.
-
-
-Step 4:  Create a subscription
-On the topic detail page, click Create subscription. Set Protocol to Email. In the Endpoint field, enter your email address. Click Create subscription.
-📷  A confirmation email will arrive in your inbox immediately. You must click the confirmation link in that email before alerts will work.
-
-
-Step 5:  Confirm your email
-Open your inbox, find the email from AWS Notifications with the subject AWS Notification - Subscription Confirmation, and click the Confirm subscription link inside it.
-📷  After confirming, go back to SNS → Topics → your topic → Subscriptions. The Status column should now show Confirmed.
-
-
-⚠ WARNING
-If Status still shows PendingConfirmation after 5 minutes, check your spam/junk folder. The confirmation link expires after 3 days.
-
-
-
-2
-Create S3 Bucket for CloudTrail Logs
-S3 → Create bucket → Set bucket policy → Enable EventBridge
-
-
-Step 1:  Navigate to S3
-In the AWS Console search bar, type S3 and click S3 from the results.
-📷  The S3 console shows all your existing buckets.
-
-
-Step 2:  Create a new bucket
-Click Create bucket. Enter a globally unique bucket name (e.g. cloudtrail-logs-<your-account-id>). Make sure the Region is set to your region (ap-south-1). Leave all other settings as default. Click Create bucket at the bottom.
-📷  After creation, your new bucket will appear in the bucket list.
-
-
-Step 3:  Add the bucket policy
-Click on your new bucket. Go to the Permissions tab. Scroll down to Bucket policy. Click Edit. Paste the policy below — replace <your-bucket-name> and <your-account-id> with your real values. Click Save changes.
-📷  The policy editor shows a JSON text area. Paste exactly as shown below.
-
-
-Bucket policy — replace <your-bucket-name> and <your-account-id>
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AWSCloudTrailAclCheck",
-      "Effect": "Allow",
-      "Principal": {"Service": "cloudtrail.amazonaws.com"},
-      "Action": "s3:GetBucketAcl",
-      "Resource": "arn:aws:s3:::<your-bucket-name>"
-    },
-    {
-      "Sid": "AWSCloudTrailWrite",
-      "Effect": "Allow",
-      "Principal": {"Service": "cloudtrail.amazonaws.com"},
-      "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::<your-bucket-name>/AWSLogs/<your-account-id>/*",
-      "Condition": {
-        "StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}
-      }
-    }
-  ]
-}
-
-
-Step 4:  Enable EventBridge notifications
-While still in your bucket, go to the Properties tab. Scroll down to Amazon EventBridge. Click Edit. Toggle the setting to On. Click Save changes.
-📷  After saving, the EventBridge section will show On in green.
-
-
-
-3
-Create CloudTrail
-CloudTrail → Trails → Create trail
-
-
-Step 1:  Navigate to CloudTrail
-In the AWS Console search bar, type CloudTrail and click CloudTrail from the results. Then click Trails in the left sidebar.
-📷  If you see existing trails, that is fine — you are creating a new one.
-
-
-Step 2:  Start creating a trail
-Click Create trail.
-📷  You will see a multi-step form. Fill in the details as described in the steps below.
-
-
-Step 3:  Set trail name and storage
-Trail name: enter your trail name (e.g. resource-monitor-trail). Storage location: select Use existing S3 bucket. S3 bucket: select the bucket you created in Step 2. Important: Under Additional settings, make sure Enable log file validation is checked.
-📷  The trail name field is at the top of the form. The S3 bucket field has a Browse button to find your bucket.
-
-
-Step 4:  Set the trail to all regions
-Scroll down to find the option Apply trail to all regions or Enable for all regions. Make sure this is checked / set to Yes. This ensures actions in all AWS regions are captured.
-📷  This option is critical. Without it, only actions in ap-south-1 will be captured.
-
-
-Step 5:  SKIP CloudWatch Logs
-You will see a CloudWatch Logs section. Leave this DISABLED. Do not enable it. We are using the S3 → EventBridge approach instead which does not require this.
-📷  If you accidentally enable CloudWatch Logs, it may cause permission errors unless iam:PassRole is granted.
-
-
-Step 6:  Set events to Write only
-Scroll to the Log events section. Under Management events, set API activity to Write only. This filters out read-only calls and prevents inbox flooding.
-📷  Read events like ListBuckets and DescribeInstances happen thousands of times per day — filtering them out is important.
-
-
-Step 7:  Create the trail
-Scroll to the bottom and click Create trail.
-📷  You will be taken to the trail detail page. Check that Trail logging shows a green Logging status. If it shows Stopped, click the toggle to enable logging.
-
-
-
-4
-Create Lambda IAM Role
-IAM → Roles → Create role
-
-
-Step 1:  Navigate to IAM Roles
-In the AWS Console search bar, type IAM and click IAM. Then click Roles in the left sidebar. Click Create role.
-📷  The Create role wizard has 3 steps: Trusted entity, Permissions, Name.
-
-
-Step 2:  Set trusted entity
-Under Trusted entity type, select AWS service. Under Use case, find and select Lambda. Click Next.
-📷  This tells AWS that this role will be assumed by Lambda functions.
-
-
-Step 3:  Attach permissions
-In the search box, search for and select each of these policies: AmazonS3ReadOnlyAccess, AWSLambdaBasicExecutionRole, AmazonSNSFullAccess. Check the box next to each one. Click Next.
-📷  You can search for each policy name one at a time using the filter box. Make sure all three show a checkmark before clicking Next.
-
-
-Step 4:  Name the role
-Enter a Role name such as lambda-cloudtrail-role. Click Create role.
-📷  After creation, click on the new role and copy its ARN from the top of the page. It looks like: arn:aws:iam::<account-id>:role/lambda-cloudtrail-role
-
-
-
-5
-Create Lambda Function
-Lambda → Functions → Create function
-
-
-Step 1:  Navigate to Lambda
-In the AWS Console search bar, type Lambda and click Lambda. Then click Functions in the left sidebar. Click Create function.
-📷  Make sure you are in the correct region (ap-south-1 shown top right).
-
-
-Step 2:  Configure the function
-Select Author from scratch. Function name: enter your function name (e.g. cloudtrail-alert-handler). Runtime: select Python 3.12. Architecture: x86_64. Under Permissions, choose Use an existing role and select the role you created in Step 4. Click Create function.
-📷  After creation you will be taken to the function editor page.
-
-
-Step 3:  Add the function code
-In the Code tab, click on lambda_function.py in the file browser. Delete all existing code. Paste the Python code from Part A Step 5a above (the full code between PYEOF markers). Click Deploy.
-📷  The Deploy button is orange and appears above the code editor. You must click Deploy — just saving is not enough.
-
-
-Step 4:  Add environment variable
-Go to the Configuration tab. Click Environment variables in the left sub-menu. Click Edit. Click Add environment variable. Key: SNS_TOPIC_ARN. Value: paste your SNS Topic ARN from Step 1 (the full arn:aws:sns:... string). Click Save.
-📷  The full ARN looks like: arn:aws:sns:ap-south-1:123456789012:resource-change-alerts. Do NOT paste the subscription ARN (which has a UUID at the end) — only the topic ARN.
-
-
-Step 5:  Increase timeout
-Still in the Configuration tab, click General configuration. Click Edit. Change Timeout from 3 seconds to 30 seconds. Click Save.
-📷  The default 3-second timeout is too short for reading S3 files and publishing to SNS.
-
-
-
-6
-Create EventBridge Rule
-EventBridge → Rules → Create rule
-
-
-Step 1:  Navigate to EventBridge
-In the AWS Console search bar, type EventBridge and click Amazon EventBridge. Then click Rules in the left sidebar. Make sure you are in the correct region (ap-south-1). Click Create rule.
-📷  The EventBridge console shows Event buses and Rules in the left sidebar.
-
-
-Step 2:  Name and configure the rule
-Name: enter your rule name (e.g. detect-cloudtrail-log-created). Event bus: leave as default. Rule type: select Rule with an event pattern. Click Next.
-📷  Leave all other settings as default on this page.
-
-
-Step 3:  Set the event pattern
-Under Event source, select AWS events or EventBridge partner events. Scroll down to Event pattern. Select Custom pattern (JSON editor). Delete the existing content and paste the JSON below — replace <your-bucket-name> with your S3 bucket name. Click Next.
-📷  The custom pattern editor accepts raw JSON. Paste exactly as shown.
-
-
-EventBridge event pattern — replace <your-bucket-name>
-{
-  "source": ["aws.s3"],
-  "detail-type": ["Object Created"],
-  "detail": {
-    "bucket": {
-      "name": ["<your-bucket-name>"]
-    }
-  }
-}
-
-
-Step 4:  Set the target
-Under Target types, select AWS service. Under Select a target, choose Lambda function. Under Function, select your Lambda function (e.g. cloudtrail-alert-handler). IMPORTANT: Under Permissions, do NOT add an execution role. Leave the Permissions section empty or choose Use existing role and clear the field if possible. Click Next.
-📷  If the console forces you to select a role for Lambda, this will not work correctly. In that case, use the CLI Step 6 commands to set the target without a role.
-
-
-Step 5:  Review and create
-Review all settings. Click Create rule.
-📷  The rule will appear in the Rules list with Status: Enabled.
-
-
-
-7
-Test the Setup
-Create a resource and verify the full pipeline works
-
-
-Step 1:  Create a test S3 bucket
-Go to S3 and create a new test bucket (any name). Make sure the region is ap-south-1.
-📷  This will be the action that triggers CloudTrail → EventBridge → Lambda → SNS → Email.
-
-
-Step 2:  Wait 5–15 minutes
-CloudTrail batches log delivery to S3. The alert will not arrive instantly — wait at least 5 minutes before troubleshooting.
-📷  This is normal behaviour. The delay is from CloudTrail batch delivery, not from Lambda or SNS.
-
-
-Step 3:  Check EventBridge fired
-Go to EventBridge → Rules → your rule → Monitoring tab. Look at the TriggeredRules metric. It should show a count greater than 0.
-📷  If TriggeredRules is 0, EventBridge did not detect a new file in S3. Check that EventBridge notification is enabled on the S3 bucket (Step 2, sub-step 4).
-
-
-Step 4:  Check Lambda was invoked
-Go to Lambda → your function → Monitor tab. Look at the Invocations graph. It should show at least 1 invocation.
-📷  If Invocations is 0, EventBridge is not triggering Lambda. Check that the Lambda resource-based policy allows EventBridge (CLI Step 6b).
-
-
-Step 5:  Check your email inbox
-You should receive an email with subject like [CREATE] <your-username> did CreateBucket in ap-south-1.
-📷  Check spam/junk folder if not found in inbox.
-
-
-
-Sample Email You Will Receive
-Below is an example of the detailed email you will receive for every resource change. The format is the same for all AWS services — only the Resource Details section changes.
-
-Subject:  [CREATE] john.admin did CreateBucket in ap-south-1
 ================================================
   AWS RESOURCE CHANGE ALERT
 ================================================
@@ -957,7 +530,7 @@ WHO DID IT
 IAM USER    : john.admin
 USER TYPE   : IAMUser
 USER ARN    : arn:aws:iam::<account-id>:user/john.admin
-ACCOUNT ID  : <your-account-id>
+ACCOUNT ID  : 123456789012
 SOURCE IP   : 203.0.113.25
 USER AGENT  : Mozilla/5.0 Chrome/147.0.0.0
 ------------------------------------------------
@@ -967,62 +540,90 @@ Bucket Name   : my-new-production-bucket
 REQUEST ID  : F831V1YP114NM8K9
 EVENT ID    : 9e20bf90-4178-4d30-94ff-6b539e164e96
 ================================================
+```
 
+---
 
+## Challenges and How to Solve Them
 
-Troubleshooting Guide
-If something is not working, go through this table from top to bottom. Each row tells you what to check and how to fix it.
+Building this system surfaces a few stumbling blocks that are worth knowing about in advance.
 
-Symptom
-Where to check
-Fix
-No email received at all
-SNS → Topics → Subscriptions
-Status must be Confirmed. If PendingConfirmation — check spam folder and click the confirmation link.
-Email received for test but not for real actions
-EventBridge → Rules → Monitoring
-Check TriggeredRules count. If 0 — EventBridge notification is not enabled on the S3 bucket.
-EventBridge triggered but Lambda not invoked
-Lambda → Configuration → Permissions
-Check Resource-based policy. Must have a statement allowing events.amazonaws.com to invoke.
-Lambda invoked but no email sent
-Lambda → Monitor → CloudWatch Logs
-Check logs for SNS errors. Most common: SNS_TOPIC_ARN env var has extra UUID at end — use only the topic ARN without the subscription ID.
-Alerts only come from one region
-CloudTrail → Trails → your trail
-Check Multi-region trail shows Yes. If No — recreate trail with --is-multi-region-trail flag.
-Getting too many alerts (inbox flooding)
-CloudTrail → Trails → Event selectors
-Set ReadWriteType to WriteOnly. This excludes List/Describe read calls.
-Delay longer than 20 minutes
-CloudTrail → Trails → status
-Check Latest log file delivered timestamp. If stuck — try stopping and restarting logging.
-InvalidParameter error for SNS
-Lambda → Configuration → Env vars
-SNS_TOPIC_ARN value is wrong. Correct format: arn:aws:sns:region:accountid:topicname — no UUID suffix.
+**The `iam:PassRole` permission problem.** The documentation for many CloudTrail monitoring setups describes routing logs through CloudWatch Logs. In AWS Organization accounts, this approach quietly fails because creating a trail with CloudWatch Logs integration requires `iam:PassRole`, and Organisation administrators frequently restrict this permission. The S3-to-EventBridge approach sidesteps this entirely — no `iam:PassRole` required.
 
+**SNS subscription confusion.** SNS produces two different ARNs: the topic ARN (`arn:aws:sns:region:accountid:topicname`) and the subscription ARN (`arn:aws:sns:region:accountid:topicname:some-uuid`). Lambda needs the topic ARN. Using the subscription ARN in the environment variable produces an `InvalidParameter` error that can be hard to trace back to its source. Always double-check that the ARN in your `SNS_TOPIC_ARN` variable does not contain a UUID suffix.
 
-AWS Services Covered
-The Lambda function automatically detects and extracts specific details for the following services. For any other service, the raw request parameters are included in the email.
+**IAM role propagation delay.** When you create an IAM role and immediately try to create a Lambda function that uses it, AWS sometimes returns an error saying the role does not exist. The role is created — it just has not fully propagated through AWS's internal systems yet. The `sleep 10` before the Lambda deployment command is not decorative; it genuinely prevents this race condition.
 
-Service
-Details included in the alert email
-S3
-Bucket name, object key
-EC2
-Instance ID, instance type, AMI ID, instance state
-IAM
-User name, role name, policy name, new resource ARN
-RDS
-DB instance ID, engine type
-Lambda
-Function name, runtime
-DynamoDB
-Table name
-All others
-Full raw request parameters (first 300 characters)
+**Inbox flooding from read events.** If you skip the `put-event-selectors` step that filters to write-only events, every `ListBuckets`, `DescribeInstances`, `GetCallerIdentity`, and similar read call generates an alert. In an active account this can be hundreds of emails per hour. The write-only filter is not optional in practice.
 
+---
 
-✅ TIP
-This document does not contain any real AWS account IDs, bucket names, ARNs, or any other account-specific information. All values shown are placeholders or examples only.
+## Key Learnings
 
+A few insights stand out from building this kind of monitoring:
+
+The gap between "AWS has this data" and "you can actually act on this data" is enormous. CloudTrail captures everything by default — it always has. The challenge is never collection; it is surfacing. Most organisations have a fully populated CloudTrail and have never once opened it proactively.
+
+The 5 to 15 minute delay feels longer in a monitoring context than it sounds on paper. If a junior team member accidentally deletes a DynamoDB table at 3 PM, the window to recover from a point-in-time backup before customers notice is measured in minutes. Getting the alert by 3:12 PM rather than 3:01 PM is a meaningful difference. Understanding this delay helps set the right expectations.
+
+Least-privilege IAM scoping on the Lambda role is genuinely important here, not just box-checking. Lambda only needs `s3:GetObject` on one specific bucket and `sns:Publish` on one specific topic. Giving it `AmazonS3FullAccess` would work but creates a situation where a misconfigured function could delete the very logs it is supposed to read.
+
+---
+
+## Best Practices Followed
+
+**Multi-region trail with global service events.** Using `--is-multi-region-trail` and `--include-global-service-events` ensures that IAM changes (which are global, not regional) and actions in any AWS region are captured. A regional-only trail creates a blind spot for anyone who knows which region is being monitored.
+
+**Write-only event filtering.** Capturing only write events keeps the signal-to-noise ratio high. Read events are useful for deep security forensics but actively counterproductive for an alerting system designed to be checked by humans.
+
+**No CloudWatch Logs integration.** Deliberately excluded to ensure compatibility across Organisation accounts without requiring elevated IAM permissions.
+
+**Scoped IAM permissions.** The Lambda role's permissions reference specific resource ARNs rather than wildcards, following the AWS principle of least privilege.
+
+**Timeout tuned to the workload.** The 30-second timeout reflects the actual execution profile of the function — S3 fetch, decompression, JSON parsing, and potentially multiple SNS publishes in a single invocation.
+
+---
+
+## Final Results
+
+Once deployed, this system provides continuous IAM activity visibility with no ongoing maintenance required. Every write action across every AWS region generates a formatted email within 15 minutes, regardless of which IAM user performed it or from which region. The architecture is entirely serverless — there are no servers to maintain, no agents to update, and the cost is negligible for typical account activity (Lambda, EventBridge, and SNS all operate within free tier limits for most use cases).
+
+---
+
+## Conclusion
+
+Monitoring is not glamorous infrastructure work, but it is the work that matters most when something goes wrong at 2 AM. What this setup provides is not just alerting — it is institutional visibility. When every admin on your team is subscribed to the same SNS topic, accidental changes become visible to everyone immediately, and the culture of "check before you delete" gets enforced automatically rather than through policy documents nobody reads.
+
+The architecture is intentionally simple. No third-party services, no agents, no complex event schemas. Just five AWS services wired together in a chain that does exactly one thing: make sure you know when your account changes.
+
+Clean up resources when you no longer need them in this order: EventBridge rule first, then Lambda, then SNS, then CloudTrail, and finally the S3 bucket and IAM role.
+
+---
+
+## Future Improvements
+
+Several extensions could make this system more powerful:
+
+- **Slack or Teams integration** — modify the Lambda function to also post to a webhook, so alerts appear in the team's primary communication channel in near-real-time
+- **Severity filtering** — classify events by risk level and only page on-call engineers for high-severity actions like IAM policy changes or security group modifications
+- **Resource tagging checks** — extend the Lambda function to verify whether newly created resources have required tags, and alert if they are missing
+- **DynamoDB audit log** — store every processed event in a DynamoDB table, enabling historical queries like "show me everything john.admin did last week"
+- **Cross-account monitoring** — extend the trail to an AWS Organisation trail and process alerts centrally from a dedicated security account
+
+---
+
+## License
+
+> The scripts and code in this article are free to use and modify for personal or commercial use. No attribution required, but always appreciated. Use at your own risk in production — always test in a safe environment first.
+
+---
+
+Feel free to connect and discuss on [LinkedIn](https://www.linkedin.com) or leave a comment below — whether you ran into a different error, extended the Lambda function with something clever, or just want to share how you ended up using this in your own environment. This kind of infrastructure works best when the community improves it together.
+
+---
+
+**Tags:** `AWS` `CloudTrail` `DevOps` `Security` `Lambda`
+
+**SEO Subtitle:** Build a serverless AWS IAM activity monitor using CloudTrail, EventBridge, Lambda, and SNS — step-by-step for beginners with no prior CLI experience
+
+**Estimated reading time:** 18 minutes
