@@ -129,8 +129,6 @@ Under **Security Group**, create `jenkins-sg` with these inbound rules:
 | Custom TCP | 8080 | 0.0.0.0/0 (Jenkins UI) |
 | Custom TCP | 50000 | 0.0.0.0/0 (Jenkins agent communication) |
 
-[Insert Screenshot Here: EC2 Launch Instance form filled out for jenkins-server]
-
 #### 1.2 Application Server (EC2 #2)
 
 Launch a second instance:
@@ -170,8 +168,6 @@ ssh -i ~/Downloads/blue-green-key.pem ubuntu@<APP_SERVER_IP>
 ```
 
 The `chmod 400` is mandatory — SSH will outright refuse to use a key file that has overly permissive permissions.
-
-[Insert Screenshot Here: Both EC2 instances showing "Running" status in the AWS dashboard]
 
 ---
 
@@ -260,8 +256,6 @@ The `sleep 40` gives Jenkins time to fully initialise before checking its status
 
 **Expected output:** `Active: active (running) since ...`
 
-[Insert Screenshot Here: Jenkins systemd status showing "active (running)"]
-
 #### 2.6 Install Docker on the Jenkins Server
 
 The Jenkins pipeline builds Docker images, so Docker must be present — and critically, the `jenkins` user must be in the `docker` group:
@@ -299,8 +293,6 @@ sudo cat /var/lib/jenkins/secrets/initialAdminPassword
 ```
 
 Open your browser at `http://<JENKINS_IP>:8080`, paste the password, click **Install suggested plugins**, wait 2–3 minutes, then create your admin user.
-
-[Insert Screenshot Here: Jenkins "Getting Started" screen showing plugin installation in progress]
 
 ---
 
@@ -528,7 +520,7 @@ name: blue-project
 
 services:
   frontend-blue:
-    image: bhavyatank13/frontend-app:${TAG}
+    image: <docker-hub-username>/frontend-app:${TAG}
     container_name: frontend-blue
     ports:
       - "3001:3000"
@@ -539,7 +531,7 @@ services:
       - blue-network
 
   backend-blue:
-    image: bhavyatank13/backend-app:${TAG}
+    image: <docker-hub-username>/backend-app:${TAG}
     container_name: backend-blue
     ports:
       - "5001:5000"
@@ -561,7 +553,7 @@ name: green-project
 
 services:
   frontend-green:
-    image: bhavyatank13/frontend-app:${TAG}
+    image: <docker-hub-username>/frontend-app:${TAG}
     container_name: frontend-green
     ports:
       - "3002:3000"
@@ -572,7 +564,7 @@ services:
       - green-network
 
   backend-green:
-    image: bhavyatank13/backend-app:${TAG}
+    image: <docker-hub-username>/backend-app:${TAG}
     container_name: backend-green
     ports:
       - "5002:5000"
@@ -599,8 +591,8 @@ if [ -z "$TAG" ]; then echo "ERROR: TAG required"; exit 1; fi
 echo "=== Deploying BLUE | Tag: $TAG ==="
 cd /opt/blue-green
 export TAG=$TAG
-docker pull bhavyatank13/frontend-app:$TAG
-docker pull bhavyatank13/backend-app:$TAG
+docker pull <docker-hub-username>/frontend-app:$TAG
+docker pull <docker-hub-username>/backend-app:$TAG
 docker compose -f docker-compose.blue.yml down --remove-orphans || true
 docker compose -f docker-compose.blue.yml up -d
 echo "=== Blue deployed ==="
@@ -622,8 +614,8 @@ if [ -z "$TAG" ]; then echo "ERROR: TAG required"; exit 1; fi
 echo "=== Deploying GREEN | Tag: $TAG ==="
 cd /opt/blue-green
 export TAG=$TAG
-docker pull bhavyatank13/frontend-app:$TAG
-docker pull bhavyatank13/backend-app:$TAG
+docker pull <docker-hub-username>/frontend-app:$TAG
+docker pull <docker-hub-username>/backend-app:$TAG
 docker compose -f docker-compose.green.yml down --remove-orphans || true
 docker compose -f docker-compose.green.yml up -d
 echo "=== Green deployed ==="
@@ -728,9 +720,9 @@ This is the heart of the pipeline. Every stage is connected:
 pipeline {
     agent any
     environment {
-        DOCKER_HUB_USER = 'bhavyatank13'
-        FRONTEND_IMAGE  = 'bhavyatank13/frontend-app'
-        BACKEND_IMAGE   = 'bhavyatank13/backend-app'
+        DOCKER_HUB_USER = '<docker-hub-username>'
+        FRONTEND_IMAGE  = '<docker-hub-username>/frontend-app'
+        BACKEND_IMAGE   = '<docker-hub-username>/backend-app'
         APP_SERVER_IP   = '<YOUR_APP_SERVER_IP>'
         APP_SERVER_USER = 'ubuntu'
         TAG             = "${BUILD_NUMBER}"
@@ -844,8 +836,6 @@ Log in to [hub.docker.com](https://hub.docker.com) and create two public reposit
 
 > 💡 **Note:** Jenkins will push images tagged with the build number (1, 2, 3, ...) to these repos. Each build gets a unique, immutable tag — so you can always roll back to any previous version by its number.
 
-[Insert Screenshot Here: Docker Hub showing both repositories created and public]
-
 ---
 
 ### Step 6: Set Up SSH Key (Jenkins → App Server)
@@ -948,8 +938,6 @@ Script Path:      Jenkinsfile
 
 Click **Save**.
 
-[Insert Screenshot Here: Jenkins pipeline job configuration showing SCM settings]
-
 ---
 
 ### Step 9: Initial Nginx Setup on the App Server
@@ -988,8 +976,6 @@ Go to **Jenkins UI → blue-green-pipeline → Build Now**. Click the build numb
 | Switch Nginx Traffic | Updates Nginx to point to green |
 | Remove Old Environment | Brings down blue containers |
 
-[Insert Screenshot Here: Jenkins pipeline showing all stages green / successful]
-
 After the build completes, verify on the app server:
 
 ```bash
@@ -1000,8 +986,6 @@ curl http://localhost/api/health   # Should return: {"status":"healthy"}
 ```
 
 Open your browser at `http://<APP_SERVER_IP>` — you should see "Hello from Frontend! Version 1".
-
-[Insert Screenshot Here: Browser showing the frontend app with "Version 1" badge]
 
 ---
 
@@ -1036,8 +1020,6 @@ git push origin main
 Then in Jenkins, click **Build Now**. The pipeline now detects green as active and deploys to blue. After the health check passes, Nginx switches to blue and tears down green.
 
 Open the browser at `http://<APP_SERVER_IP>` — it now shows "Version 2". No interruption, no reload required.
-
-[Insert Screenshot Here: Browser showing the frontend app with "Version 2" badge after the switch]
 
 ---
 
@@ -1174,10 +1156,6 @@ After the full setup:
 - Rollback takes under 10 seconds (just a traffic switch, no redeployment).
 - Every build is tagged and traceable on Docker Hub.
 - The pipeline automatically recovers from failed deployments.
-
-[Insert Screenshot Here: Jenkins showing multiple successful builds with incrementing build numbers]
-
-[Insert Screenshot Here: Docker Hub showing tagged images with build numbers]
 
 ---
 
