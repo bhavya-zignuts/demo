@@ -1,614 +1,1204 @@
-# Someone Deleted a Production S3 Bucket at 2 AM — Here's the Monitoring System That Would Have Caught It
+# Zero Downtime Deployments with Blue-Green Strategy Using Jenkins, Docker, and Nginx on AWS EC2
 
-**Build a real-time AWS IAM activity monitor using CloudTrail, EventBridge, Lambda, and SNS — no third-party tools, no extra costs**
+> **A complete, production-grade walkthrough of automating blue-green deployments — from infrastructure setup to zero-downtime traffic switching — with every real error and fix documented.**
 
 ---
 
-There is a story that circulates in cloud engineering circles that goes something like this: a startup woke up one morning to find that a senior developer, working late the night before, had accidentally deleted the wrong S3 bucket during a cleanup task. The bucket held three years of user-uploaded content. Backups existed — but were two weeks old. Recovery took four days and cost the company over $200,000 in lost data, engineering time, and emergency infrastructure work.
+## The Incident That Made This Click
 
-The painful part was not the mistake itself. Humans make mistakes. The painful part was that no one knew it had happened until customers started filing support tickets the next morning. There was no alert. There was no notification. There was no trail of breadcrumbs that would have let someone catch the deletion within minutes — before caches expired, before CDNs purged, before the situation became irreversible.
+Picture this: it's a Friday evening, a team pushes a release to their e-commerce platform. The deployment takes the server down for nearly four minutes while the new version boots up. In those four minutes, hundreds of users hit a dead page. Orders are lost. Customer support gets flooded. The team rolls back, and now the whole weekend becomes a post-mortem.
 
-When you read a story like that, the first question that comes to mind is not "how do we prevent mistakes?" — you cannot. The question is: "how do we know immediately when something changes in our AWS environment?"
+That scenario plays out more often than people admit — not because the code was broken, but because the **deployment strategy itself was flawed**. The idea that you have to take something offline to update it is a design choice, not a technical necessity.
 
-That is exactly what this guide builds.
+Reading about this kind of incident is what pushed me to explore blue-green deployment properly — not just as a theoretical concept, but as a fully implemented, automated pipeline. This article is the result of that deep-dive.
 
 ---
 
 ## Why This Problem Matters
 
-AWS accounts in real organisations are busy places. IAM users are creating EC2 instances, modifying security groups, attaching policies, running Lambda functions, and deleting objects dozens or hundreds of times a day. Most of it is routine. Some of it is accidental. A small fraction of it is something you absolutely need to know about the moment it happens.
+Traditional deployment workflows have a fundamental flaw: there's always a window where the old version is gone but the new version isn't ready yet. Even if that window is thirty seconds, it's thirty seconds of downtime — and in production, that's unacceptable.
 
-The standard AWS Console provides CloudTrail — a service that records every API call made in your account. But CloudTrail on its own is a passive archive. It records everything and then sits quietly waiting for someone to come looking. Nobody goes looking until something breaks.
+Blue-green deployment solves this by keeping two identical environments alive. One serves users right now. The other receives the new version quietly in the background. When the new version passes a health check, Nginx flips the traffic — instantly, atomically, with zero dropped requests.
 
-What this project does is flip that model. Instead of you going to find the logs, the logs come to find you. The moment any IAM user performs a write action anywhere in your account — creates a bucket, launches an instance, modifies a policy, deletes a function — you receive a detailed email within 5 to 15 minutes, formatted to tell you exactly who did it, from where, at what time, and on what resource.
+The benefits compound quickly:
 
-It solves several real problems at once:
-
-- Security auditing becomes passive rather than active — you do not need to remember to check logs
-- Accidental deletions or misconfigurations surface immediately, while they can still be reversed
-- In regulated environments, you have an automatic audit trail delivered to your inbox
-- In team environments, every admin can be subscribed, so shared accountability becomes the default
+- **Zero downtime** on every release, regardless of the size of the change.
+- **Instant rollback** — if something goes wrong after the switch, flipping back takes seconds.
+- **Safe testing** — the new version is fully deployed and validated before a single user sees it.
+- **Build traceability** — every Docker image is tagged with the Jenkins build number, so you always know exactly what's running.
 
 ---
 
 ## Project Overview
 
-Here is what the final system looks like from the outside:
+Here's what this project implements end-to-end:
 
-- Any IAM user performs a write action (create, update, delete, modify) anywhere in your AWS account
-- Within 5 to 15 minutes, you receive a formatted email with the action type, the user who performed it, the AWS region, the exact timestamp, the resource details, and the source IP address
-- The system covers all AWS regions by default — not just one
-- It filters out read-only calls (List, Describe, Get) so your inbox does not flood with noise
-- It requires no third-party tools, no paid monitoring services, and no agents installed anywhere
-
-The components involved are: SNS for email delivery, S3 for log storage, CloudTrail for API capture, EventBridge for triggering, Lambda for processing, and IAM for permissions.
+- Two AWS EC2 instances: one for Jenkins CI/CD, one for the application environments.
+- A Jenkins pipeline that triggers on every git push, builds Docker images, pushes them to Docker Hub, and orchestrates the full deployment.
+- Two isolated environments — **Blue** (ports 3001/5001) and **Green** (ports 3002/5002) — alternating with each deployment.
+- Nginx on the application server acting as the single entry point, dynamically switching upstream targets.
+- Shell scripts that handle deployment, health checks, traffic switching, and rollback.
+- A minimal Node.js + Express backend and an Nginx-served HTML frontend, both containerised.
 
 ---
 
 ## Architecture and Workflow
 
 ```
-IAM User performs action
-         │
-         ▼
-    CloudTrail
-    (captures every API call across all regions)
-         │
-         ▼ every 5–15 minutes
-    S3 Bucket
-    (compressed .gz JSON log files)
-         │
-         ▼ on new file written
-    EventBridge Rule
-    (detects Object Created event from S3)
-         │
-         ▼
-    Lambda Function
-    (reads log, extracts events, formats email)
-         │
-         ▼
-    SNS Topic
-    (publishes to all subscribed email addresses)
-         │
-         ▼
-    Your Inbox 📧
+Your Local Machine
+      |
+      |  git push
+      v
+GitHub Repository
+      |
+      |  Jenkins polls / triggered manually
+      v
+Jenkins Server (EC2 #1)
+      |  docker build frontend + backend images
+      |  docker push --> Docker Hub
+      |  SSH --> App Server
+      v
+Application Server (EC2 #2)
+      |
+      |-- Blue Environment:  frontend-blue:3001, backend-blue:5001
+      |-- Green Environment: frontend-green:3002, backend-green:5002
+      |
+      v
+Nginx (port 80)
+      |-- /       --> active frontend container
+      |-- /api/   --> active backend container
+      v
+Browser: http://<APP_SERVER_IP>
 ```
 
-Why this specific path — S3 to EventBridge — rather than the more commonly documented CloudTrail to CloudWatch Logs route? Because the CloudWatch Logs approach requires an IAM permission called `iam:PassRole` that is frequently restricted in AWS Organization accounts. If your account lives inside an Organisation, you may not have that permission even with AdministratorAccess. The S3-based approach works reliably with standard IAM Admin access across all account types.
+### The Switch Logic
+
+At any moment, exactly one environment is live and the other is idle. The pipeline:
+
+1. Reads `/opt/blue-green/active-env` to know which environment is currently serving traffic.
+2. Deploys the new version to the **inactive** environment.
+3. Runs health checks — waits up to 50 seconds with retries before declaring success.
+4. Updates the Nginx config and reloads it (a graceful reload — no dropped connections).
+5. Writes the new active environment to `active-env`.
+6. Tears down the old environment's containers.
+
+The next deployment reverses direction. Blue → Green → Blue → Green, cycling automatically forever.
 
 ---
 
 ## Prerequisites
 
-Before starting, confirm you have the following:
+Before starting, make sure you have the following in place:
 
-- An AWS account with IAM Admin access (AdministratorAccess policy attached to your user)
-- Access to AWS CloudShell — the browser-based terminal built into the AWS Console, no installation needed
-- Your 12-digit AWS Account ID, visible in the top-right corner of the AWS Console
-- An email address where you want to receive alerts
-
-You do not need root access. You do not need the AWS CLI installed locally. Everything runs inside CloudShell.
-
-> ✅ **About the placeholder values in this guide:** Every command uses placeholders like `<your-account-id>` and `<your-region>`. You must substitute your real values before running any command. A full reference table appears before each command block.
+| Requirement | Details |
+|---|---|
+| AWS Account | Active account with EC2 permissions in `ap-south-1` (Mumbai) or your preferred region |
+| Docker Hub Account | Account at hub.docker.com — images will be pushed here |
+| GitHub Account | A repository to host your code and Jenkinsfile |
+| SSH Client | Terminal with SSH support (Mac/Linux or Windows PowerShell) |
+| Local Git | Git installed locally for pushing code |
+| Browser | Any modern browser for accessing the Jenkins UI |
 
 ---
 
 ## Step-by-Step Implementation
 
-### Step 1: Create the SNS Topic and Subscribe Your Email
+### Step 1: Create EC2 Instances on AWS
 
-SNS (Simple Notification Service) is the delivery mechanism — think of it as a mailing list. You create a topic (the list), and your email address subscribes to it. Later, Lambda will publish messages to this topic, and SNS delivers them to every subscriber.
+Log in to the [AWS Console](https://console.aws.amazon.com) and confirm your region in the top-right corner.
 
-Open AWS CloudShell from the terminal icon in the top navigation bar and wait for the prompt.
+#### 1.1 Jenkins Server (EC2 #1)
 
-| Placeholder | Example | Replace with |
-|---|---|---|
-| `<your-topic-name>` | `resource-change-alerts` | Any name, hyphens allowed, no spaces |
-| `<your-region>` | `ap-south-1` | Your AWS region |
+Go to **EC2 → Launch Instance** and configure:
 
-```bash
-aws sns create-topic \
-  --name <your-topic-name> \
-  --region <your-region>
+```
+Name:           jenkins-server
+AMI:            Ubuntu Server 24.04 LTS (HVM), SSD Volume Type
+Instance Type:  t2.medium  (minimum 2GB RAM — Jenkins is memory-hungry)
+Key Pair:       Create new → Name: blue-green-key → Download .pem file
+Storage:        20 GB gp3
 ```
 
-The output returns a `TopicArn` that looks like:
+> ⚠️ **Warning:** Download the `.pem` file immediately. AWS only lets you download it once. Lose it and you cannot SSH into your instance.
 
-```json
-{
-    "TopicArn": "arn:aws:sns:ap-south-1:123456789012:resource-change-alerts"
+Under **Security Group**, create `jenkins-sg` with these inbound rules:
+
+| Type | Port | Source |
+|---|---|---|
+| SSH | 22 | My IP only |
+| Custom TCP | 8080 | 0.0.0.0/0 (Jenkins UI) |
+| Custom TCP | 50000 | 0.0.0.0/0 (Jenkins agent communication) |
+
+[Insert Screenshot Here: EC2 Launch Instance form filled out for jenkins-server]
+
+#### 1.2 Application Server (EC2 #2)
+
+Launch a second instance:
+
+```
+Name:           app-server
+AMI:            Ubuntu Server 24.04 LTS (HVM)
+Instance Type:  t2.small
+Key Pair:       Select existing → blue-green-key
+Storage:        20 GB gp3
+```
+
+Create `app-server-sg` with these inbound rules:
+
+| Type | Port | Purpose |
+|---|---|---|
+| SSH | 22 | My IP only |
+| HTTP | 80 | Public Nginx entry point |
+| Custom TCP | 3001 | Blue frontend (for direct testing) |
+| Custom TCP | 3002 | Green frontend (for direct testing) |
+| Custom TCP | 5001 | Blue backend (for direct testing) |
+| Custom TCP | 5002 | Green backend (for direct testing) |
+
+#### 1.3 Connect via SSH
+
+Once both instances show **Running** status, note their public IPs from the EC2 dashboard. Then connect:
+
+```bash
+# Fix key permissions first — required on Mac/Linux
+chmod 400 ~/Downloads/blue-green-key.pem
+
+# Connect to Jenkins Server
+ssh -i ~/Downloads/blue-green-key.pem ubuntu@<JENKINS_IP>
+
+# Open a second terminal and connect to App Server
+ssh -i ~/Downloads/blue-green-key.pem ubuntu@<APP_SERVER_IP>
+```
+
+The `chmod 400` is mandatory — SSH will outright refuse to use a key file that has overly permissive permissions.
+
+[Insert Screenshot Here: Both EC2 instances showing "Running" status in the AWS dashboard]
+
+---
+
+### Step 2: Install Tools on the Jenkins Server
+
+All commands in this section run on the **Jenkins Server** terminal.
+
+#### 2.1 Install Java 21
+
+Jenkins's latest versions require Java 21 as a minimum. Java 17 will cause a startup failure.
+
+```bash
+sudo apt-get update -y
+sudo apt-get install -y openjdk-21-jdk
+java -version
+```
+
+**Expected output:** `openjdk version "21.x.x" ...`
+
+> 💡 **Note:** If you already have Java 17 installed from a previous attempt, run: `sudo apt-get install -y openjdk-21-jdk && sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java` to switch the default.
+
+#### 2.2 Create the Jenkins User and Directories
+
+Jenkins runs as its own system user for security isolation. We create that user and set up its home and log directories:
+
+```bash
+sudo adduser --system --home /var/lib/jenkins --shell /bin/bash jenkins
+sudo groupadd jenkins
+sudo usermod -g jenkins jenkins
+sudo mkdir -p /var/lib/jenkins
+sudo mkdir -p /var/log/jenkins
+sudo chown -R jenkins:jenkins /var/lib/jenkins
+sudo chown -R jenkins:jenkins /var/log/jenkins
+```
+
+> ⚠️ **Warning:** The `--system` flag on `adduser` does not automatically create a matching group. If the `chown` commands fail with `invalid group: 'jenkins:jenkins'`, run `sudo groupadd jenkins && sudo usermod -g jenkins jenkins` first, then retry.
+
+#### 2.3 Download Jenkins via WAR File
+
+The standard Jenkins apt repository had GPG key verification issues on Ubuntu 24.04. Downloading the WAR file directly is the reliable path — it's the same Jenkins, just installed differently:
+
+```bash
+sudo wget -O /var/lib/jenkins/jenkins.war \
+  https://get.jenkins.io/war-stable/latest/jenkins.war
+
+sudo chown jenkins:jenkins /var/lib/jenkins/jenkins.war
+ls -lh /var/lib/jenkins/jenkins.war
+```
+
+**Expected output:** `-rw-r--r-- 1 jenkins jenkins 95M ... jenkins.war`
+
+#### 2.4 Create a Systemd Service for Jenkins
+
+Instead of running Jenkins manually, we register it as a proper system service so it starts automatically on reboot and restarts on failure:
+
+```bash
+sudo tee /etc/systemd/system/jenkins.service > /dev/null <<'EOF'
+[Unit]
+Description=Jenkins Automation Server
+After=network.target
+
+[Service]
+Type=simple
+User=jenkins
+Environment="JENKINS_HOME=/var/lib/jenkins"
+Environment="JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64"
+ExecStart=/usr/lib/jvm/java-21-openjdk-amd64/bin/java -jar /var/lib/jenkins/jenkins.war --httpPort=8080
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+#### 2.5 Start Jenkins
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start jenkins
+sudo systemctl enable jenkins
+sleep 40 && sudo systemctl status jenkins --no-pager
+```
+
+The `sleep 40` gives Jenkins time to fully initialise before checking its status.
+
+**Expected output:** `Active: active (running) since ...`
+
+[Insert Screenshot Here: Jenkins systemd status showing "active (running)"]
+
+#### 2.6 Install Docker on the Jenkins Server
+
+The Jenkins pipeline builds Docker images, so Docker must be present — and critically, the `jenkins` user must be in the `docker` group:
+
+```bash
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu \
+$(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt-get update -y
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker ubuntu
+sudo usermod -aG docker jenkins
+docker --version
+```
+
+> ⚠️ **Warning:** Adding the `jenkins` user to the `docker` group only takes effect after restarting Jenkins. If the pipeline fails with `permission denied while trying to connect to the Docker daemon socket`, run: `sudo usermod -aG docker jenkins && sudo systemctl restart jenkins` — then wait 40 seconds before re-running the build.
+
+#### 2.7 Set Up the Jenkins UI
+
+Get the initial admin password:
+
+```bash
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+```
+
+Open your browser at `http://<JENKINS_IP>:8080`, paste the password, click **Install suggested plugins**, wait 2–3 minutes, then create your admin user.
+
+[Insert Screenshot Here: Jenkins "Getting Started" screen showing plugin installation in progress]
+
+---
+
+### Step 3: Install Tools on the Application Server
+
+Switch to the **App Server** terminal. Run this complete installation script in one go:
+
+```bash
+sudo apt-get update -y && sudo apt-get upgrade -y
+
+# Install Docker
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu \
+$(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt-get update -y
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker ubuntu
+
+# Install Nginx
+sudo apt-get install -y nginx
+sudo systemctl start nginx
+sudo systemctl enable nginx
+
+# Create deployment directories
+sudo mkdir -p /opt/blue-green/scripts
+sudo mkdir -p /opt/blue-green/logs
+sudo chown -R ubuntu:ubuntu /opt/blue-green
+```
+
+After the script completes, verify everything installed correctly:
+
+```bash
+docker --version
+docker compose version
+nginx -v
+```
+
+Log out and back in so the `docker` group membership takes effect:
+
+```bash
+exit
+ssh -i ~/Downloads/blue-green-key.pem ubuntu@<APP_SERVER_IP>
+docker ps   # Should show an empty list with no permission error
+```
+
+---
+
+### Step 4: Set Up the GitHub Repository
+
+All the code, scripts, Dockerfiles, and the Jenkinsfile live in one GitHub repository. Jenkins fetches this automatically on every build.
+
+#### 4.1 Repository Structure
+
+```
+blue-green-project-2/
+├── frontend/
+│   ├── src/
+│   │   └── index.html
+│   ├── Dockerfile
+│   └── nginx.conf
+├── backend/
+│   ├── src/
+│   │   └── server.js
+│   ├── package.json
+│   └── Dockerfile
+├── docker-compose.blue.yml
+├── docker-compose.green.yml
+├── scripts/
+│   ├── deploy-blue.sh
+│   ├── deploy-green.sh
+│   ├── health-check.sh
+│   ├── switch.sh
+│   └── rollback.sh
+└── Jenkinsfile
+```
+
+Clone the repo and create the directories locally:
+
+```bash
+git clone https://github.com/<your-username>/<your-repo>.git
+cd <your-repo>
+mkdir -p frontend/src backend/src scripts
+```
+
+#### 4.2 Frontend Application
+
+**File: `frontend/src/index.html`**
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Blue-Green App</title>
+  <style>
+    body { font-family: Arial, sans-serif; display: flex;
+           justify-content: center; align-items: center;
+           min-height: 100vh; background: #f0f4f8; }
+    .card { background: white; padding: 40px 60px;
+            border-radius: 12px; text-align: center; }
+    .version { background: #48bb78; color: white;
+               padding: 4px 16px; border-radius: 20px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Hello from Frontend!</h1>
+    <p>Blue-Green Deployment Project</p>
+    <span class="version">Version 1</span>
+    <div>
+      <button onclick="callBackend()">Call /api/hello</button>
+      <div id="api-result"></div>
+    </div>
+  </div>
+  <script>
+    async function callBackend() {
+      const res = await fetch('/api/hello');
+      const data = await res.json();
+      document.getElementById('api-result').textContent = JSON.stringify(data);
+    }
+  </script>
+</body>
+</html>
+```
+
+**File: `frontend/nginx.conf`**
+
+```nginx
+server {
+    listen 3000;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
 }
 ```
 
-> ❗ **Copy this ARN immediately.** You will need it in Steps 4 and 5. Save it in a text file or note.
+This configures Nginx inside the container to serve static files on port 3000 (which gets mapped to 3001 or 3002 on the host).
 
-Now subscribe your email to the topic:
+**File: `frontend/Dockerfile`**
 
-```bash
-aws sns subscribe \
-  --topic-arn <your-topic-arn> \
-  --protocol email \
-  --notification-endpoint <your-email@domain.com> \
-  --region <your-region>
+```dockerfile
+FROM nginx:alpine
+RUN rm /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY src/ /usr/share/nginx/html/
+EXPOSE 3000
+CMD ["nginx", "-g", "daemon off;"]
 ```
 
-> ⚠️ **Critical:** AWS immediately sends a confirmation email to your inbox. You must open that email and click the "Confirm subscription" link. If you skip this step, you will never receive any alerts. Also check your spam folder — AWS notification emails sometimes land there.
+#### 4.3 Backend Application
 
-To add additional recipients (other admins, a team inbox), simply repeat the subscribe command with each additional email address. There is no limit on subscribers.
+**File: `backend/src/server.js`**
 
-[Insert Screenshot Here: CloudShell terminal showing TopicArn in output]
+```javascript
+const express = require('express');
+const app = express();
+const PORT = 5000;
 
----
+app.get('/', (req, res) => {
+  res.json({ message: 'Hello from Backend!', version: '1',
+             environment: process.env.ENV || 'unknown' });
+});
 
-### Step 2: Create the S3 Bucket for CloudTrail Logs
+app.get('/hello', (req, res) => {
+  res.json({ message: 'Hello from Backend API!', version: '1',
+             environment: process.env.ENV || 'unknown' });
+});
 
-This bucket is the storage layer where CloudTrail writes its log files. EventBridge watches this bucket and fires whenever a new file appears. The bucket needs two things beyond basic creation: a policy granting CloudTrail write access, and EventBridge notifications enabled.
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy', version: '1' });
+});
 
-| Placeholder | Example | Replace with |
-|---|---|---|
-| `<your-bucket-name>` | `cloudtrail-logs-123456789012` | Must be globally unique — use your account ID |
-| `<your-region>` | `ap-south-1` | Your AWS region |
-
-```bash
-aws s3 mb s3://<your-bucket-name> \
-  --region <your-region>
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
 ```
 
-> ✅ **Tip on bucket naming:** S3 bucket names must be unique across every AWS account in the world, not just yours. The pattern `cloudtrail-logs-<your-account-id>` is a reliable choice — your account ID guarantees global uniqueness.
+The `/health` endpoint is what the health check script polls. It must return HTTP 200 — that's the signal the container is ready.
 
-Next, attach the bucket policy. Without this, CloudTrail will refuse to write to the bucket. The policy grants two specific permissions: the ability for CloudTrail to read the bucket ACL, and the ability to write objects under the `AWSLogs/<your-account-id>/` prefix.
+**File: `backend/package.json`**
 
-```bash
-aws s3api put-bucket-policy \
-  --bucket <your-bucket-name> \
-  --policy '{
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Sid": "AWSCloudTrailAclCheck",
-        "Effect": "Allow",
-        "Principal": {"Service": "cloudtrail.amazonaws.com"},
-        "Action": "s3:GetBucketAcl",
-        "Resource": "arn:aws:s3:::<your-bucket-name>"
-      },
-      {
-        "Sid": "AWSCloudTrailWrite",
-        "Effect": "Allow",
-        "Principal": {"Service": "cloudtrail.amazonaws.com"},
-        "Action": "s3:PutObject",
-        "Resource": "arn:aws:s3:::<your-bucket-name>/AWSLogs/<your-account-id>/*",
-        "Condition": {
-          "StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}
-        }
-      }
-    ]
-  }'
+```json
+{
+  "name": "backend-app",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": { "start": "node src/server.js" },
+  "dependencies": { "express": "^4.18.2" }
+}
 ```
 
-No output from this command means success — that is expected behaviour.
+**File: `backend/Dockerfile`**
 
-Finally, enable EventBridge notifications on the bucket. This single command tells S3 to emit an event to EventBridge every time any object is created in this bucket:
-
-```bash
-aws s3api put-bucket-notification-configuration \
-  --bucket <your-bucket-name> \
-  --notification-configuration '{"EventBridgeConfiguration": {}}'
+```dockerfile
+FROM node:18-alpine
+WORKDIR /app
+COPY package.json ./
+RUN npm install --production
+COPY src/ ./src/
+EXPOSE 5000
+CMD ["node", "src/server.js"]
 ```
 
-Again, no output means it worked.
+Using `node:18-alpine` keeps the image small. `--production` skips dev dependencies.
 
-[Insert Screenshot Here: AWS Console S3 bucket with EventBridge notifications enabled (green "On" toggle)]
+#### 4.4 Docker Compose Files
 
----
+> ⚠️ **Critical:** Each compose file must have a unique `name` field and a unique network name. Without this, Docker treats both as the same project and removes the wrong containers during cleanup — this caused a major issue that's documented in the Challenges section below.
 
-### Step 3: Create the CloudTrail Trail
+**File: `docker-compose.blue.yml`**
 
-CloudTrail is the recording layer. It intercepts every API call made in your account and writes a record of it. We create a multi-region trail, which means it captures actions in every AWS region — not just the one you are working in. Without multi-region coverage, someone spinning up an EC2 instance in `us-east-1` would be invisible to a trail configured only in `ap-south-1`.
+```yaml
+name: blue-project
 
-| Placeholder | Example | Replace with |
-|---|---|---|
-| `<your-trail-name>` | `resource-monitor-trail` | Any name, no spaces |
-| `<your-bucket-name>` | `cloudtrail-logs-123456789012` | The bucket from Step 2 |
-| `<your-region>` | `ap-south-1` | Your AWS region |
+services:
+  frontend-blue:
+    image: bhavyatank13/frontend-app:${TAG}
+    container_name: frontend-blue
+    ports:
+      - "3001:3000"
+    environment:
+      - ENV=blue
+    restart: unless-stopped
+    networks:
+      - blue-network
 
-```bash
-aws cloudtrail create-trail \
-  --name <your-trail-name> \
-  --s3-bucket-name <your-bucket-name> \
-  --is-multi-region-trail \
-  --include-global-service-events \
-  --no-is-organization-trail \
-  --region <your-region>
+  backend-blue:
+    image: bhavyatank13/backend-app:${TAG}
+    container_name: backend-blue
+    ports:
+      - "5001:5000"
+    environment:
+      - ENV=blue
+    restart: unless-stopped
+    networks:
+      - blue-network
+
+networks:
+  blue-network:
+    name: blue-network
 ```
 
-> ⚠️ **The `--no-is-organization-trail` flag is not optional.** If your account belongs to an AWS Organization and you omit this flag, CloudTrail will attempt to create an organisation-level trail and route events to the management account instead of yours. You will receive nothing.
+**File: `docker-compose.green.yml`**
 
-Start logging immediately after trail creation:
+```yaml
+name: green-project
 
-```bash
-aws cloudtrail start-logging \
-  --name <your-trail-name> \
-  --region <your-region>
+services:
+  frontend-green:
+    image: bhavyatank13/frontend-app:${TAG}
+    container_name: frontend-green
+    ports:
+      - "3002:3000"
+    environment:
+      - ENV=green
+    restart: unless-stopped
+    networks:
+      - green-network
+
+  backend-green:
+    image: bhavyatank13/backend-app:${TAG}
+    container_name: backend-green
+    ports:
+      - "5002:5000"
+    environment:
+      - ENV=green
+    restart: unless-stopped
+    networks:
+      - green-network
+
+networks:
+  green-network:
+    name: green-network
 ```
 
-Now configure the trail to only capture write events. This is a crucial quality-of-life decision. AWS APIs include thousands of read-only calls like `ListBuckets`, `DescribeInstances`, and `GetCallerIdentity` that happen continuously in the background. If you capture all events, your inbox will receive hundreds of emails per day for completely routine activity. Filtering to write-only events means you only hear about actions that actually change something.
+#### 4.5 Deployment Scripts
+
+**File: `scripts/deploy-blue.sh`**
 
 ```bash
-aws cloudtrail put-event-selectors \
-  --trail-name <your-trail-name> \
-  --event-selectors '[{
-    "ReadWriteType": "WriteOnly",
-    "IncludeManagementEvents": true
-  }]' \
-  --region <your-region>
+#!/bin/bash
+set -e
+TAG=$1
+if [ -z "$TAG" ]; then echo "ERROR: TAG required"; exit 1; fi
+echo "=== Deploying BLUE | Tag: $TAG ==="
+cd /opt/blue-green
+export TAG=$TAG
+docker pull bhavyatank13/frontend-app:$TAG
+docker pull bhavyatank13/backend-app:$TAG
+docker compose -f docker-compose.blue.yml down --remove-orphans || true
+docker compose -f docker-compose.blue.yml up -d
+echo "=== Blue deployed ==="
 ```
 
-[Insert Screenshot Here: CloudTrail console showing trail status as "Logging" with green indicator]
+What this script does:
+- Accepts the image tag (build number) as its first argument.
+- Pulls the latest images from Docker Hub explicitly — ensuring the newest version is used rather than a cached local copy.
+- Brings down any existing blue containers cleanly before starting fresh.
+- Starts the new containers in detached mode.
 
----
-
-### Step 4: Create the Lambda IAM Role
-
-Lambda functions need an IAM role — a permission set that defines what they are allowed to do. This role needs three specific abilities: reading objects from S3 (to fetch the log file), writing to CloudWatch Logs (so you can debug Lambda if something goes wrong), and publishing to SNS (to send the email).
+**File: `scripts/deploy-green.sh`** (mirrors deploy-blue.sh but for the green environment)
 
 ```bash
-aws iam create-role \
-  --role-name <your-role-name> \
-  --assume-role-policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {"Service": "lambda.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }]
-  }'
+#!/bin/bash
+set -e
+TAG=$1
+if [ -z "$TAG" ]; then echo "ERROR: TAG required"; exit 1; fi
+echo "=== Deploying GREEN | Tag: $TAG ==="
+cd /opt/blue-green
+export TAG=$TAG
+docker pull bhavyatank13/frontend-app:$TAG
+docker pull bhavyatank13/backend-app:$TAG
+docker compose -f docker-compose.green.yml down --remove-orphans || true
+docker compose -f docker-compose.green.yml up -d
+echo "=== Green deployed ==="
 ```
 
-Copy the `Arn` from the output. It looks like `arn:aws:iam::123456789012:role/lambda-cloudtrail-role`. You will need this in Step 5.
-
-Now attach the actual permissions. Notice that the S3 permission is scoped specifically to your log bucket, and the SNS permission is scoped specifically to your topic. This follows the principle of least privilege — the function can only touch exactly what it needs.
+**File: `scripts/health-check.sh`**
 
 ```bash
-aws iam put-role-policy \
-  --role-name <your-role-name> \
-  --policy-name LambdaAlertsPolicy \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],
-        "Resource": "*"
-      },
-      {
-        "Effect": "Allow",
-        "Action": ["s3:GetObject"],
-        "Resource": "arn:aws:s3:::<your-bucket-name>/*"
-      },
-      {
-        "Effect": "Allow",
-        "Action": ["sns:Publish"],
-        "Resource": "arn:aws:sns:<your-region>:<your-account-id>:<your-topic-name>"
-      }
-    ]
-  }'
+#!/bin/bash
+ENV=$1
+MAX_RETRIES=10
+SLEEP_SECONDS=5
+if [ "$ENV" = "blue" ]; then FRONTEND_PORT=3001; BACKEND_PORT=5001;
+elif [ "$ENV" = "green" ]; then FRONTEND_PORT=3002; BACKEND_PORT=5002;
+else echo "ERROR: specify blue or green"; exit 1; fi
+
+echo "=== Health Check: $ENV ==="
+sleep 10   # Wait for containers to fully start
+
+for i in $(seq 1 $MAX_RETRIES); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$FRONTEND_PORT)
+  if [ "$STATUS" = "200" ]; then echo "Frontend healthy!"; break; fi
+  echo "Attempt $i/$MAX_RETRIES - waiting..."; sleep $SLEEP_SECONDS
+  if [ $i -eq $MAX_RETRIES ]; then echo "FAILED"; exit 1; fi
+done
+
+for i in $(seq 1 $MAX_RETRIES); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$BACKEND_PORT/health)
+  if [ "$STATUS" = "200" ]; then echo "Backend healthy!"; break; fi
+  echo "Attempt $i/$MAX_RETRIES - waiting..."; sleep $SLEEP_SECONDS
+  if [ $i -eq $MAX_RETRIES ]; then echo "FAILED"; exit 1; fi
+done
+echo "=== Health check PASSED ==="
 ```
 
----
+What this script does:
+- Waits 10 seconds after deployment for containers to fully initialise.
+- Polls both the frontend and backend separately, retrying up to 10 times with 5-second gaps (up to 50 seconds total).
+- Exits with a non-zero code if either check fails — causing the Jenkins stage to fail and triggering the rollback.
 
-### Step 5: Create and Deploy the Lambda Function
-
-Lambda is the brain of the entire system. When EventBridge tells it a new log file has arrived in S3, it fetches the file, decompresses it, reads through every event record, classifies each action as CREATE, DELETE, UPDATE, or CHANGE, formats a readable email message, and publishes it to SNS.
-
-First, create the Python source file and package it for deployment:
-
-```bash
-mkdir -p /tmp/lambda-alert
-
-cat > /tmp/lambda-alert/lambda_function.py << 'PYEOF'
-import json, boto3, os, gzip
-s3  = boto3.client('s3')
-sns = boto3.client('sns')
-SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
-
-def get_resource_details(record):
-    src = record.get('eventSource','')
-    req = record.get('requestParameters') or {}
-    res = record.get('responseElements') or {}
-    d = []
-    if 's3' in src:
-        if req.get('bucketName'): d.append(f"Bucket Name   : {req['bucketName']}")
-        if req.get('key'):        d.append(f"Object Key    : {req['key']}")
-    elif 'ec2' in src:
-        for i in res.get('instancesSet',{}).get('items',[]):
-            d.append(f"Instance ID   : {i.get('instanceId','N/A')}")
-            d.append(f"Instance Type : {i.get('instanceType','N/A')}")
-            d.append(f"AMI ID        : {i.get('imageId','N/A')}")
-    elif 'iam' in src:
-        if req.get('userName'):  d.append(f"IAM User      : {req['userName']}")
-        if req.get('roleName'):  d.append(f"IAM Role      : {req['roleName']}")
-        if req.get('policyName'):d.append(f"Policy Name   : {req['policyName']}")
-    elif 'rds' in src:
-        if req.get('dBInstanceIdentifier'): d.append(f"DB Instance   : {req['dBInstanceIdentifier']}")
-        if req.get('engine'):               d.append(f"DB Engine     : {req['engine']}")
-    elif 'lambda' in src:
-        if req.get('functionName'): d.append(f"Function Name : {req['functionName']}")
-    elif 'dynamodb' in src:
-        if req.get('tableName'):    d.append(f"Table Name    : {req['tableName']}")
-    if not d and req:
-        d.append(f"Params : {json.dumps(req,default=str)[:300]}")
-    return '\n'.join(d) if d else 'No additional resource details'
-
-def lambda_handler(event, context):
-    bucket = event['detail']['bucket']['name']
-    key    = event['detail']['object']['key']
-    data   = json.loads(gzip.decompress(
-        s3.get_object(Bucket=bucket,Key=key)['Body'].read()))
-    sent = 0
-    for rec in data.get('Records',[]):
-        if rec.get('readOnly', True): continue
-        uid   = rec.get('userIdentity',{})
-        uname = uid.get('userName',
-            uid.get('sessionContext',{}).get('sessionIssuer',{}).get('userName','Unknown'))
-        ename  = rec.get('eventName','Unknown')
-        region = rec.get('awsRegion','Unknown')
-        tag = ('[CREATE]' if any(x in ename for x in ['Create','Run','Launch','Add','Put','Attach'])
-          else '[DELETE]' if any(x in ename for x in ['Delete','Remove','Terminate','Detach'])
-          else '[UPDATE]' if any(x in ename for x in ['Update','Modify','Change','Enable','Disable'])
-          else '[CHANGE]')
-        msg = f'''
-================================================
-  AWS RESOURCE CHANGE ALERT
-================================================
-ACTION TYPE : {tag}
-EVENT NAME  : {ename}
-AWS SERVICE : {rec.get('eventSource','N/A')}
-REGION      : {region}
-TIME (UTC)  : {rec.get('eventTime','N/A')}
-------------------------------------------------
-WHO DID IT
-IAM USER    : {uname}
-USER TYPE   : {uid.get('type','N/A')}
-USER ARN    : {uid.get('arn','N/A')}
-ACCOUNT ID  : {uid.get('accountId','N/A')}
-SOURCE IP   : {rec.get('sourceIPAddress','N/A')}
-USER AGENT  : {rec.get('userAgent','N/A')[:80]}
-------------------------------------------------
-RESOURCE DETAILS
-{get_resource_details(rec)}
-------------------------------------------------
-REQUEST ID  : {rec.get('requestID','N/A')}
-EVENT ID    : {rec.get('eventID','N/A')}
-================================================'''
-        try:
-            sns.publish(
-                TopicArn=SNS_TOPIC_ARN,
-                Subject=f"{tag} {uname} did {ename} in {region}"[:100],
-                Message=msg.strip())
-            sent += 1
-        except Exception as e:
-            print(f'SNS error: {e}')
-    return {'statusCode':200,'body':f'{sent} alerts sent'}
-PYEOF
-
-cd /tmp/lambda-alert && zip lambda.zip lambda_function.py
-echo 'Code packaged successfully'
-```
-
-**What each part of the code does:**
-
-- `get_resource_details()` — a helper function that inspects the event source (S3, EC2, IAM, RDS, Lambda, DynamoDB) and extracts the most meaningful identifier for each service type. For S3 it returns the bucket name; for EC2 it returns the instance ID and type; for IAM it returns the user or role name. For any other service it falls back to dumping the raw request parameters.
-
-- `lambda_handler()` — the main function. It receives the EventBridge event, extracts the S3 bucket and file key, fetches and decompresses the CloudTrail log, then loops through every record in the file. It skips read-only events (those with `readOnly: true`), classifies write events by tag, formats the email body, and publishes each one to SNS.
-
-- The action classification block (`[CREATE]`, `[DELETE]`, `[UPDATE]`, `[CHANGE]`) — uses simple keyword matching against the event name. `CreateBucket` becomes `[CREATE]`, `DeleteFunction` becomes `[DELETE]`, `ModifyDBInstance` becomes `[UPDATE]`. This makes the email subject immediately scannable.
-
-Now deploy the function. Note the 10-second wait — IAM roles require a brief propagation period before Lambda can assume them.
-
-| Placeholder | Replace with |
-|---|---|
-| `<your-function-name>` | Name for your Lambda function |
-| `<your-account-id>` | Your 12-digit AWS Account ID |
-| `<your-role-name>` | The role name from Step 4 |
-| `<your-topic-arn>` | The full SNS Topic ARN from Step 1 |
-| `<your-region>` | Your AWS region |
+**File: `scripts/switch.sh`**
 
 ```bash
-sleep 10  # Wait for IAM role to propagate
+#!/bin/bash
+ENV=$1
+if [ "$ENV" = "blue" ]; then FRONTEND_PORT=3001; BACKEND_PORT=5001;
+elif [ "$ENV" = "green" ]; then FRONTEND_PORT=3002; BACKEND_PORT=5002;
+else echo "ERROR: specify blue or green"; exit 1; fi
 
-aws lambda create-function \
-  --function-name <your-function-name> \
-  --runtime python3.12 \
-  --role arn:aws:iam::<your-account-id>:role/<your-role-name> \
-  --handler lambda_function.lambda_handler \
-  --zip-file fileb:///tmp/lambda-alert/lambda.zip \
-  --environment Variables={SNS_TOPIC_ARN=<your-topic-arn>} \
-  --timeout 30 \
-  --region <your-region>
-```
-
-> ⚠️ **The timeout matters.** The default Lambda timeout is 3 seconds. Reading a CloudTrail log from S3 and publishing multiple SNS messages takes longer than that under normal conditions. Setting it to 30 seconds prevents silent failures where Lambda starts, runs out of time, and exits without sending anything.
-
-[Insert Screenshot Here: Lambda function page showing Deployed status and environment variable set]
-
----
-
-### Step 6: Create the EventBridge Rule
-
-EventBridge is the trigger mechanism. It watches your S3 bucket and, the moment CloudTrail writes a new log file, fires the Lambda function automatically.
-
-| Placeholder | Replace with |
-|---|---|
-| `<your-rule-name>` | A name for this rule |
-| `<your-bucket-name>` | Your S3 bucket from Step 2 |
-| `<your-region>` | Your AWS region |
-
-```bash
-aws events put-rule \
-  --name <your-rule-name> \
-  --event-pattern '{
-    "source": ["aws.s3"],
-    "detail-type": ["Object Created"],
-    "detail": {
-      "bucket": { "name": ["<your-bucket-name>"] }
+sudo tee /etc/nginx/sites-available/blue-green > /dev/null <<NGINX
+upstream frontend_active { server 127.0.0.1:${FRONTEND_PORT}; }
+upstream backend_active  { server 127.0.0.1:${BACKEND_PORT};  }
+server {
+    listen 80; server_name _;
+    location / {
+        proxy_pass http://frontend_active;
+        proxy_set_header Host \$host;
     }
-  }' \
-  --state ENABLED \
-  --region <your-region>
+    location /api/ {
+        rewrite ^/api(/.*)$ \$1 break;
+        proxy_pass http://backend_active;
+        proxy_set_header Host \$host;
+    }
+}
+NGINX
+
+sudo ln -sf /etc/nginx/sites-available/blue-green /etc/nginx/sites-enabled/blue-green
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+echo $ENV | sudo tee /opt/blue-green/active-env > /dev/null
+echo "=== Nginx now pointing to: $ENV ==="
 ```
 
-Copy the `RuleArn` from the output.
+What this script does:
+- Dynamically writes a fresh Nginx config file pointing to the correct port.
+- Creates a symlink in `sites-enabled` so Nginx picks it up.
+- Removes the default Nginx site to avoid conflicts.
+- Validates the config with `nginx -t` before reloading — if the config is broken, the reload never happens, protecting the current live environment.
+- Writes the new environment name to the `active-env` file so the next Jenkins build knows which environment to target.
 
-Grant EventBridge permission to invoke your Lambda function:
+**File: `scripts/rollback.sh`**
 
 ```bash
-aws lambda add-permission \
-  --function-name <your-function-name> \
-  --statement-id AllowEventBridgeInvoke \
-  --action lambda:InvokeFunction \
-  --principal events.amazonaws.com \
-  --source-arn arn:aws:events:<your-region>:<your-account-id>:rule/<your-rule-name> \
-  --region <your-region>
+#!/bin/bash
+ENV=$1
+if [ -z "$ENV" ]; then
+  CURRENT=$(cat /opt/blue-green/active-env 2>/dev/null)
+  if [ "$CURRENT" = "blue" ]; then ENV="green"; else ENV="blue"; fi
+  echo "Auto rollback: $CURRENT -> $ENV"
+fi
+bash /opt/blue-green/scripts/switch.sh $ENV
+echo "=== Rollback complete. Now pointing to: $ENV ==="
 ```
 
-Then connect the rule to Lambda as its target:
+Rollback is just a traffic switch. It auto-detects which environment is currently live and flips to the opposite one.
+
+#### 4.6 The Jenkinsfile
+
+This is the heart of the pipeline. Every stage is connected:
+
+```groovy
+pipeline {
+    agent any
+    environment {
+        DOCKER_HUB_USER = 'bhavyatank13'
+        FRONTEND_IMAGE  = 'bhavyatank13/frontend-app'
+        BACKEND_IMAGE   = 'bhavyatank13/backend-app'
+        APP_SERVER_IP   = '<YOUR_APP_SERVER_IP>'
+        APP_SERVER_USER = 'ubuntu'
+        TAG             = "${BUILD_NUMBER}"
+    }
+    stages {
+        stage('Checkout Code') {
+            steps { checkout scm }
+        }
+        stage('Build Docker Images') {
+            steps {
+                sh """
+                    docker build -t ${FRONTEND_IMAGE}:${TAG} ./frontend
+                    docker build -t ${BACKEND_IMAGE}:${TAG}  ./backend
+                """
+            }
+        }
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS')]) {
+                    sh """
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push ${FRONTEND_IMAGE}:${TAG}
+                        docker push ${BACKEND_IMAGE}:${TAG}
+                    """
+                }
+            }
+        }
+        stage('Detect Active Environment') {
+            steps {
+                script {
+                    def result = sh(script: """ssh -i /var/lib/jenkins/.ssh/app-server-key \\
+                        -o StrictHostKeyChecking=no ${APP_SERVER_USER}@${APP_SERVER_IP} \\
+                        'cat /opt/blue-green/active-env 2>/dev/null || echo none'""",
+                        returnStdout: true).trim()
+                    if (result == 'blue') { env.ACTIVE_ENV='blue'; env.INACTIVE_ENV='green' }
+                    else                  { env.ACTIVE_ENV='green'; env.INACTIVE_ENV='blue' }
+                }
+            }
+        }
+        stage('Deploy to Inactive Environment') {
+            steps {
+                sh """ssh -i /var/lib/jenkins/.ssh/app-server-key \\
+                    -o StrictHostKeyChecking=no ${APP_SERVER_USER}@${APP_SERVER_IP} \\
+                    'bash /opt/blue-green/scripts/deploy-${env.INACTIVE_ENV}.sh ${TAG}'"""
+            }
+        }
+        stage('Health Check') {
+            steps {
+                sh """ssh -i /var/lib/jenkins/.ssh/app-server-key \\
+                    -o StrictHostKeyChecking=no ${APP_SERVER_USER}@${APP_SERVER_IP} \\
+                    'bash /opt/blue-green/scripts/health-check.sh ${env.INACTIVE_ENV}'"""
+            }
+        }
+        stage('Switch Nginx Traffic') {
+            steps {
+                sh """ssh -i /var/lib/jenkins/.ssh/app-server-key \\
+                    -o StrictHostKeyChecking=no ${APP_SERVER_USER}@${APP_SERVER_IP} \\
+                    'bash /opt/blue-green/scripts/switch.sh ${env.INACTIVE_ENV}'"""
+            }
+        }
+        stage('Remove Old Environment') {
+            steps {
+                sh """ssh -i /var/lib/jenkins/.ssh/app-server-key \\
+                    -o StrictHostKeyChecking=no ${APP_SERVER_USER}@${APP_SERVER_IP} \\
+                    'cd /opt/blue-green && TAG=${TAG} docker compose -f docker-compose.${env.ACTIVE_ENV}.yml down --remove-orphans || true'"""
+            }
+        }
+    }
+    post {
+        success { echo "SUCCESS! Active: ${env.INACTIVE_ENV} | Tag: ${TAG}" }
+        failure {
+            sh """ssh -i /var/lib/jenkins/.ssh/app-server-key \\
+                -o StrictHostKeyChecking=no ${APP_SERVER_USER}@${APP_SERVER_IP} \\
+                'bash /opt/blue-green/scripts/rollback.sh ${env.ACTIVE_ENV}' || true"""
+        }
+    }
+}
+```
+
+What each stage does:
+- **Checkout Code** — fetches the latest commit from the GitHub branch.
+- **Build Docker Images** — builds separate images for frontend and backend, tagged with the Jenkins `BUILD_NUMBER`.
+- **Push to Docker Hub** — authenticates using stored credentials and pushes both images.
+- **Detect Active Environment** — SSHs into the app server and reads `active-env` to figure out which environment is live.
+- **Deploy to Inactive** — runs the appropriate deploy script on the app server with the new image tag.
+- **Health Check** — waits for both containers to respond with HTTP 200.
+- **Switch Nginx** — atomically moves traffic to the new environment.
+- **Remove Old** — tears down the previous environment's containers to free resources.
+- **post.failure** — if anything above fails, automatically switches Nginx back to the previous environment.
+
+#### 4.7 Push to GitHub
 
 ```bash
-aws events put-targets \
-  --rule <your-rule-name> \
-  --targets '[{
-    "Id": "LambdaTarget",
-    "Arn": "arn:aws:lambda:<your-region>:<your-account-id>:function:<your-function-name>"
-  }]' \
-  --region <your-region>
+chmod +x scripts/*.sh
+git add .
+git commit -m "v1 - initial project setup"
+git push origin main
 ```
-
-[Insert Screenshot Here: EventBridge rule showing status Enabled with Lambda as the target]
 
 ---
 
-### Step 7: Test the Full Pipeline
+### Step 5: Create Docker Hub Repositories
 
-Create a test S3 bucket to trigger the chain:
+Log in to [hub.docker.com](https://hub.docker.com) and create two public repositories:
 
-```bash
-aws s3 mb s3://test-alert-check-12345 --region <your-region>
-```
+- `frontend-app` → Public
+- `backend-app` → Public
 
-After about 2 minutes, verify CloudTrail captured the action:
+> 💡 **Note:** Jenkins will push images tagged with the build number (1, 2, 3, ...) to these repos. Each build gets a unique, immutable tag — so you can always roll back to any previous version by its number.
 
-```bash
-aws cloudtrail lookup-events \
-  --lookup-attributes AttributeKey=EventName,AttributeValue=CreateBucket \
-  --region <your-region> \
-  --max-results 3
-```
-
-You should see your `CreateBucket` event in the output. The full email alert will arrive 5 to 15 minutes after the action — CloudTrail batches its log delivery to S3, so there is an inherent delay. This is normal and expected.
-
-> ⚠️ **If no email arrives after 15 minutes:** Check these in order: (1) your SNS subscription shows "Confirmed" not "PendingConfirmation", (2) your spam/junk folder, (3) Lambda CloudWatch logs for errors. The most common error is that the `SNS_TOPIC_ARN` environment variable was set to the subscription ARN (which ends in a UUID) rather than the topic ARN.
+[Insert Screenshot Here: Docker Hub showing both repositories created and public]
 
 ---
 
-## Sample Alert Email
+### Step 6: Set Up SSH Key (Jenkins → App Server)
 
-Here is what arrives in your inbox for every write action:
+Jenkins needs to SSH into the app server to run deployment scripts. We use key-based authentication — no passwords involved.
+
+#### 6.1 Generate the Key on the Jenkins Server
+
+```bash
+# Switch to the jenkins user
+sudo su - jenkins
+
+# Generate the key pair (press Enter for all prompts — no passphrase)
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/app-server-key
+
+# Copy the public key — you'll paste this on the app server next
+cat ~/.ssh/app-server-key.pub
+```
+
+Copy the entire output starting with `ssh-rsa`.
+
+#### 6.2 Add the Public Key to the App Server
+
+On the **App Server** terminal:
+
+```bash
+nano ~/.ssh/authorized_keys
+# Paste the public key on a new line, then save (Ctrl+X, Y, Enter)
+
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+```
+
+#### 6.3 Test the Connection
+
+Back on the Jenkins Server (still as the `jenkins` user):
+
+```bash
+ssh -i ~/.ssh/app-server-key -o StrictHostKeyChecking=no ubuntu@<APP_SERVER_IP> "echo SSH works!"
+exit   # exit jenkins user back to ubuntu
+```
+
+**Expected output:** `SSH works!`
+
+> ⚠️ **Warning:** If you get `Permission denied (publickey)`, verify the key was pasted correctly in `authorized_keys` and that the file permissions are set exactly as above. A single extra character or wrong permission will break SSH auth.
+
+---
+
+### Step 7: Copy Files to the App Server
+
+The app server needs the compose files and scripts locally so Jenkins can trigger them via SSH:
+
+```bash
+# On the App Server
+git clone https://github.com/<your-username>/<your-repo>.git /tmp/blue-green-repo
+cp /tmp/blue-green-repo/docker-compose.blue.yml  /opt/blue-green/
+cp /tmp/blue-green-repo/docker-compose.green.yml /opt/blue-green/
+cp -r /tmp/blue-green-repo/scripts/ /opt/blue-green/
+chmod +x /opt/blue-green/scripts/*.sh
+
+# Verify
+ls -la /opt/blue-green/
+ls -la /opt/blue-green/scripts/
+```
+
+> ⚠️ **Important:** Whenever you update compose files or scripts in GitHub, you must also update them on the App Server manually. Jenkins only deploys your application — it doesn't sync infrastructure scripts automatically.
+
+---
+
+### Step 8: Configure Jenkins
+
+#### 8.1 Add Docker Hub Credentials
+
+In Jenkins UI: **Manage Jenkins → Credentials → System → Global credentials → Add Credentials**
 
 ```
-Subject: [CREATE] john.admin did CreateBucket in ap-south-1
+Kind:        Username with password
+Username:    <your Docker Hub username>
+Password:    <your Docker Hub password>
+ID:          dockerhub-credentials   ← exact ID used in Jenkinsfile
+Description: Docker Hub credentials
+```
 
-================================================
-  AWS RESOURCE CHANGE ALERT
-================================================
-ACTION TYPE : [CREATE]
-EVENT NAME  : CreateBucket
-AWS SERVICE : s3.amazonaws.com
-REGION      : ap-south-1
-TIME (UTC)  : 2026-04-29T08:35:02Z
-------------------------------------------------
-WHO DID IT
-IAM USER    : john.admin
-USER TYPE   : IAMUser
-USER ARN    : arn:aws:iam::<account-id>:user/john.admin
-ACCOUNT ID  : 123456789012
-SOURCE IP   : 203.0.113.25
-USER AGENT  : Mozilla/5.0 Chrome/147.0.0.0
-------------------------------------------------
-RESOURCE DETAILS
-Bucket Name   : my-new-production-bucket
-------------------------------------------------
-REQUEST ID  : F831V1YP114NM8K9
-EVENT ID    : 9e20bf90-4178-4d30-94ff-6b539e164e96
-================================================
+> ⚠️ **Warning:** The `credentialsId` in the Jenkinsfile must exactly match the ID you set here. A typo causes the push stage to fail with an authentication error.
+
+#### 8.2 Create the Pipeline Job
+
+- Click **New Item**
+- Name: `blue-green-pipeline`
+- Select: **Pipeline** → Click OK
+- Scroll to Pipeline section:
+
+```
+Definition:       Pipeline script from SCM
+SCM:              Git
+Repository URL:   https://github.com/<your-username>/<your-repo>.git
+Branch:           */main
+Script Path:      Jenkinsfile
+```
+
+Click **Save**.
+
+[Insert Screenshot Here: Jenkins pipeline job configuration showing SCM settings]
+
+---
+
+### Step 9: Initial Nginx Setup on the App Server
+
+Before the first Jenkins build, initialise Nginx to point to blue. This also creates the `active-env` file that the pipeline reads on its first run:
+
+```bash
+bash /opt/blue-green/scripts/switch.sh blue
+```
+
+**Expected output:** `=== Nginx now pointing to: blue ===`
+
+Verify Nginx is healthy:
+
+```bash
+sudo nginx -t
+sudo systemctl status nginx --no-pager
 ```
 
 ---
 
-## Challenges and How to Solve Them
+### Step 10: Run the First Jenkins Build
 
-Building this system surfaces a few stumbling blocks that are worth knowing about in advance.
+Go to **Jenkins UI → blue-green-pipeline → Build Now**. Click the build number, then **Console Output** to watch the stages execute in real time.
 
-**The `iam:PassRole` permission problem.** The documentation for many CloudTrail monitoring setups describes routing logs through CloudWatch Logs. In AWS Organization accounts, this approach quietly fails because creating a trail with CloudWatch Logs integration requires `iam:PassRole`, and Organisation administrators frequently restrict this permission. The S3-to-EventBridge approach sidesteps this entirely — no `iam:PassRole` required.
+#### What the Pipeline Does on the First Run
 
-**SNS subscription confusion.** SNS produces two different ARNs: the topic ARN (`arn:aws:sns:region:accountid:topicname`) and the subscription ARN (`arn:aws:sns:region:accountid:topicname:some-uuid`). Lambda needs the topic ARN. Using the subscription ARN in the environment variable produces an `InvalidParameter` error that can be hard to trace back to its source. Always double-check that the ARN in your `SNS_TOPIC_ARN` variable does not contain a UUID suffix.
+| Stage | What Happens |
+|---|---|
+| Checkout Code | Pulls latest from GitHub |
+| Build Docker Images | Builds both images tagged as build `#1` |
+| Push to Docker Hub | Pushes `frontend-app:1` and `backend-app:1` |
+| Detect Active Environment | Reads `active-env` → finds `blue` → sets inactive to `green` |
+| Deploy to Inactive Env | Runs `deploy-green.sh 1` on the app server |
+| Health Check | Waits and polls ports 3002 and 5002 |
+| Switch Nginx Traffic | Updates Nginx to point to green |
+| Remove Old Environment | Brings down blue containers |
 
-**IAM role propagation delay.** When you create an IAM role and immediately try to create a Lambda function that uses it, AWS sometimes returns an error saying the role does not exist. The role is created — it just has not fully propagated through AWS's internal systems yet. The `sleep 10` before the Lambda deployment command is not decorative; it genuinely prevents this race condition.
+[Insert Screenshot Here: Jenkins pipeline showing all stages green / successful]
 
-**Inbox flooding from read events.** If you skip the `put-event-selectors` step that filters to write-only events, every `ListBuckets`, `DescribeInstances`, `GetCallerIdentity`, and similar read call generates an alert. In an active account this can be hundreds of emails per hour. The write-only filter is not optional in practice.
+After the build completes, verify on the app server:
+
+```bash
+docker ps                          # Should show green containers running
+cat /opt/blue-green/active-env     # Should show: green
+curl http://localhost/             # Should return the HTML page
+curl http://localhost/api/health   # Should return: {"status":"healthy"}
+```
+
+Open your browser at `http://<APP_SERVER_IP>` — you should see "Hello from Frontend! Version 1".
+
+[Insert Screenshot Here: Browser showing the frontend app with "Version 1" badge]
+
+---
+
+### Step 11: Deploy Version 2 — Watch the Switch Happen
+
+Update your code locally to push a new version and see the blue-green switch in action.
+
+#### 11.1 Update the Frontend
+
+In `frontend/src/index.html`, change:
+
+```html
+<span class="version">Version 1</span>
+```
+
+to:
+
+```html
+<span class="version">Version 2</span>
+```
+
+Update `backend/src/server.js` — change all instances of `version: '1'` to `version: '2'`.
+
+#### 11.2 Push and Trigger
+
+```bash
+git add .
+git commit -m "version 2"
+git push origin main
+```
+
+Then in Jenkins, click **Build Now**. The pipeline now detects green as active and deploys to blue. After the health check passes, Nginx switches to blue and tears down green.
+
+Open the browser at `http://<APP_SERVER_IP>` — it now shows "Version 2". No interruption, no reload required.
+
+[Insert Screenshot Here: Browser showing the frontend app with "Version 2" badge after the switch]
+
+---
+
+### Step 12: Manual Rollback
+
+If a deployment causes issues after going live, roll back by switching Nginx to the previous environment. Since the old containers were removed by the pipeline, you first need to start them with the old image tag.
+
+#### 12.1 Find the Previous Image Tag
+
+```bash
+docker images | grep frontend-app
+```
+
+Note the older build number.
+
+#### 12.2 Start the Old Environment
+
+```bash
+cd /opt/blue-green
+export TAG=<old-build-number>
+docker compose -f docker-compose.blue.yml up -d
+```
+
+#### 12.3 Switch Nginx Back
+
+```bash
+bash /opt/blue-green/scripts/switch.sh blue
+```
+
+The previous version is live again within seconds. This is the core advantage — rollback is not a new deployment, it's just a traffic redirect.
+
+---
+
+## Challenges Faced and How They Were Solved
+
+This section documents every real error encountered during the project — because these are exactly the problems you'll hit too.
+
+### Challenge 1: Jenkins GPG Key Verification Failed
+
+**Error:** `W: GPG error: https://pkg.jenkins.io/debian-stable Release: NO_PUBKEY 7198F4B714ABFC68 / E: The repository is not signed`
+
+The standard Jenkins apt repository had a GPG key issue on Ubuntu 24.04. Rather than wrestling with GPG key imports, the cleaner solution was to download the Jenkins WAR file directly from the official source and run it as a systemd service. Same functionality, no repository dependency.
+
+---
+
+### Challenge 2: Jenkins Failed to Start — Java Version Too Old
+
+**Error:** `Running with Java 17 — minimum required version is Java 21. Supported versions: [21, 25]`
+
+Installing Java 17 first seemed reasonable since it's still widely used. However, the latest Jenkins WAR requires Java 21 minimum. Fix: install `openjdk-21-jdk` and update the systemd service's `ExecStart` path to the Java 21 binary.
+
+---
+
+### Challenge 3: Jenkins User Group Issue
+
+**Error:** `chown: invalid group: 'jenkins:jenkins'`
+
+The `adduser --system` command creates a user but not a group by default. Running `sudo groupadd jenkins && sudo usermod -g jenkins jenkins` before the `chown` commands resolves this.
+
+---
+
+### Challenge 4: Docker Permission Denied in Pipeline
+
+**Error:** `permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock`
+
+Adding a user to a group via `usermod -aG` only takes effect after that user starts a new session. Since Jenkins was already running when the `jenkins` user was added to `docker`, it needed a restart to pick up the new group membership:
+
+```bash
+sudo usermod -aG docker jenkins && sudo systemctl restart jenkins
+```
+
+---
+
+### Challenge 5: The Containers Were Being Removed Immediately
+
+**Error:** `Health check failed: backend not healthy after 10 attempts / Error response from daemon: No such container: backend-green`
+
+This was the most puzzling issue. The containers deployed successfully but vanished before the health check could reach them. The root cause: both compose files had the same implicit Docker project name (`blue-green`, derived from the directory name) and the same default network name. When the pipeline ran `docker compose down` on one file, it was actually removing containers from the other file too.
+
+Fix: add explicit `name:` fields (`blue-project` and `green-project`) at the top of each compose file, and define distinct named networks (`blue-network` and `green-network`). This makes Docker treat them as completely separate projects.
+
+---
+
+### Challenge 6: Site Unreachable After a Successful Build
+
+**Error:** Site showed 502 Bad Gateway or was completely unreachable, even though Jenkins reported deployment success.
+
+The same project name conflict from Challenge 5 was the culprit. The "Remove Old Environment" stage was removing the newly deployed containers instead of the old ones. Fixed with the same compose file changes described above.
+
+---
+
+### Challenge 7: Rollback Failing on the First Ever Build
+
+**Error:** `ROLLBACK to: null / ERROR: specify blue or green`
+
+On the very first pipeline run, the `active-env` file didn't exist yet — so the Detect Active Environment stage couldn't read it. Fix: manually run `bash /opt/blue-green/scripts/switch.sh blue` on the app server before triggering the first build. This creates the `active-env` file with `blue` as the initial value.
 
 ---
 
 ## Key Learnings
 
-A few insights stand out from building this kind of monitoring:
+A few things that would be done differently with hindsight:
 
-The gap between "AWS has this data" and "you can actually act on this data" is enormous. CloudTrail captures everything by default — it always has. The challenge is never collection; it is surfacing. Most organisations have a fully populated CloudTrail and have never once opened it proactively.
+**Unique project names from day one.** The Docker compose project name collision caused the most time-consuming debugging session. Always define explicit `name:` fields in compose files the moment you have more than one.
 
-The 5 to 15 minute delay feels longer in a monitoring context than it sounds on paper. If a junior team member accidentally deletes a DynamoDB table at 3 PM, the window to recover from a point-in-time backup before customers notice is measured in minutes. Getting the alert by 3:12 PM rather than 3:01 PM is a meaningful difference. Understanding this delay helps set the right expectations.
+**Test scripts before wiring them to Jenkins.** Running each shell script manually on the app server before connecting them to the pipeline catches issues much faster than reading pipeline logs.
 
-Least-privilege IAM scoping on the Lambda role is genuinely important here, not just box-checking. Lambda only needs `s3:GetObject` on one specific bucket and `sns:Publish` on one specific topic. Giving it `AmazonS3FullAccess` would work but creates a situation where a misconfigured function could delete the very logs it is supposed to read.
+**The `active-env` file is critical infrastructure.** It's a simple text file, but the entire blue-green logic depends on it. Initialising it before the first build should be part of the server setup, not an afterthought.
+
+**`nginx -t` before `systemctl reload` is non-negotiable.** The switch script validates the Nginx config before reloading. Without that guard, a config syntax error would take down the live site.
 
 ---
 
 ## Best Practices Followed
 
-**Multi-region trail with global service events.** Using `--is-multi-region-trail` and `--include-global-service-events` ensures that IAM changes (which are global, not regional) and actions in any AWS region are captured. A regional-only trail creates a blind spot for anyone who knows which region is being monitored.
+**Tag every image with the build number.** Using `${BUILD_NUMBER}` as the Docker tag means every image is traceable. You always know which Jenkins build produced which version, and you can redeploy any previous version by tag.
 
-**Write-only event filtering.** Capturing only write events keeps the signal-to-noise ratio high. Read events are useful for deep security forensics but actively counterproductive for an alerting system designed to be checked by humans.
+**Health check before traffic switch.** Traffic never switches unless both containers are confirmed healthy. This prevents routing users to a broken deployment.
 
-**No CloudWatch Logs integration.** Deliberately excluded to ensure compatibility across Organisation accounts without requiring elevated IAM permissions.
+**Automatic rollback in the pipeline's `post.failure` block.** If any stage fails, the pipeline automatically switches Nginx back to the previous environment — without any human intervention.
 
-**Scoped IAM permissions.** The Lambda role's permissions reference specific resource ARNs rather than wildcards, following the AWS principle of least privilege.
+**Separate networks per environment.** Giving blue and green their own Docker networks prevents any risk of cross-environment container communication.
 
-**Timeout tuned to the workload.** The 30-second timeout reflects the actual execution profile of the function — S3 fetch, decompression, JSON parsing, and potentially multiple SNS publishes in a single invocation.
+**Store credentials in Jenkins, not in code.** Docker Hub credentials are stored in Jenkins's credential store and injected via `withCredentials`. No passwords in the Jenkinsfile or the repository.
 
 ---
 
 ## Final Results
 
-Once deployed, this system provides continuous IAM activity visibility with no ongoing maintenance required. Every write action across every AWS region generates a formatted email within 15 minutes, regardless of which IAM user performed it or from which region. The architecture is entirely serverless — there are no servers to maintain, no agents to update, and the cost is negligible for typical account activity (Lambda, EventBridge, and SNS all operate within free tier limits for most use cases).
+After the full setup:
+
+- Deployments complete in approximately 2–3 minutes end-to-end.
+- Zero downtime on every switch — Nginx reload is graceful and doesn't drop active connections.
+- Rollback takes under 10 seconds (just a traffic switch, no redeployment).
+- Every build is tagged and traceable on Docker Hub.
+- The pipeline automatically recovers from failed deployments.
+
+[Insert Screenshot Here: Jenkins showing multiple successful builds with incrementing build numbers]
+
+[Insert Screenshot Here: Docker Hub showing tagged images with build numbers]
 
 ---
 
 ## Conclusion
 
-Monitoring is not glamorous infrastructure work, but it is the work that matters most when something goes wrong at 2 AM. What this setup provides is not just alerting — it is institutional visibility. When every admin on your team is subscribed to the same SNS topic, accidental changes become visible to everyone immediately, and the culture of "check before you delete" gets enforced automatically rather than through policy documents nobody reads.
+Blue-green deployment is one of those patterns that seems complex until you actually implement it — and then it feels obvious. The entire strategy boils down to a simple principle: keep a spare environment ready, deploy quietly into it, verify it works, then switch. The hard part is the plumbing — wiring together Jenkins, Docker, Nginx, and SSH in a way that's automated, recoverable, and predictable.
 
-The architecture is intentionally simple. No third-party services, no agents, no complex event schemas. Just five AWS services wired together in a chain that does exactly one thing: make sure you know when your account changes.
-
-Clean up resources when you no longer need them in this order: EventBridge rule first, then Lambda, then SNS, then CloudTrail, and finally the S3 bucket and IAM role.
+This project covers that plumbing completely. Every tool choice has a reason, every script has a guard, and every failure path has a recovery. The result is a deployment pipeline that you can run with confidence — knowing that if anything goes wrong, you're never more than ten seconds away from the previous working version.
 
 ---
 
 ## Future Improvements
 
-Several extensions could make this system more powerful:
+A few natural next steps beyond this implementation:
 
-- **Slack or Teams integration** — modify the Lambda function to also post to a webhook, so alerts appear in the team's primary communication channel in near-real-time
-- **Severity filtering** — classify events by risk level and only page on-call engineers for high-severity actions like IAM policy changes or security group modifications
-- **Resource tagging checks** — extend the Lambda function to verify whether newly created resources have required tags, and alert if they are missing
-- **DynamoDB audit log** — store every processed event in a DynamoDB table, enabling historical queries like "show me everything john.admin did last week"
-- **Cross-account monitoring** — extend the trail to an AWS Organisation trail and process alerts centrally from a dedicated security account
+- **HTTPS with Let's Encrypt** — add Certbot to the app server and configure SSL termination at Nginx.
+- **Custom domain** — connect a Route 53 hosted zone to the app server's Elastic IP.
+- **Automated rollback threshold** — extend the health check to also verify response time or error rate, and auto-rollback if metrics degrade post-switch.
+- **Multi-region deployment** — replicate the same blue-green pattern across two AWS regions for geographic redundancy.
+- **Kubernetes migration** — replace Docker Compose with Kubernetes Deployments and Services, using the same blue-green concept but with native Kubernetes traffic splitting.
+- **Slack / email notifications** — hook the Jenkins `post` block to send deployment success/failure alerts to a team channel.
 
 ---
 
@@ -618,12 +1208,14 @@ Several extensions could make this system more powerful:
 
 ---
 
-Feel free to connect and discuss on [LinkedIn](https://www.linkedin.com) or leave a comment below — whether you ran into a different error, extended the Lambda function with something clever, or just want to share how you ended up using this in your own environment. This kind of infrastructure works best when the community improves it together.
+Feel free to connect and discuss with me. Whether you hit a different error, extended this setup in an interesting direction, or just want to talk DevOps — I'm always happy to hear from you.
+
+📧 [bhavyat2520@gmail.com](mailto:bhavyat2520@gmail.com)
 
 ---
 
-**Tags:** `AWS` `CloudTrail` `DevOps` `Security` `Lambda`
+**Medium Tags:** `DevOps`, `Docker`, `AWS`, `Jenkins`, `Nginx`
 
-**SEO Subtitle:** Build a serverless AWS IAM activity monitor using CloudTrail, EventBridge, Lambda, and SNS — step-by-step for beginners with no prior CLI experience
+**SEO Subtitle:** Learn how to implement zero-downtime blue-green deployments using Jenkins, Docker, and Nginx on AWS EC2 — with every real error and fix documented.
 
-**Estimated reading time:** 18 minutes
+**Estimated Reading Time:** 18–22 minutes
